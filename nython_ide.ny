@@ -21,6 +21,7 @@ import "lib/gui_motion.ny"
 import "lib/nyimgui.ny"
 import "lib/ide_toolchain.ny"
 import "lib/ide_commands.ny"
+import "lib/ide_selection.ny"
 
 
 class IDETheme:
@@ -403,6 +404,11 @@ class NythonIDE:
         self.sel_row = 0
         self.sel_col = 0
         self.dragging_sel = false
+        # Multi-cursor (lib/ide_selection.ny). The primary caret stays
+        # buf.cursor_row/cursor_col exactly as before; selmodel.sels[0] is
+        # only a dedup mirror kept in sync right before use, and
+        # selmodel.sels[1:selmodel.count] are the actual extra carets.
+        self.selmodel = SelectionModel()
         self.outline = []
         self.outline_n = 0
         self.outline_sel = -1
@@ -964,6 +970,25 @@ class NythonIDE:
             var cm = self.f_code.width(upto)
             if self.caret_on:
                 r.fill_xywh(text_x + cm, cy + 1, 2, line_h - 2, th.accent)
+
+        # Extra carets (multi-cursor, lib/ide_selection.ny). Same blink
+        # phase as the primary; a lighter tint keeps the primary caret
+        # visually distinct from the others.
+        if self.selmodel.count > 1 and self.caret_on:
+            var ei = 1
+            while ei < self.selmodel.count:
+                var s = self.selmodel.sels[ei]
+                var erow = s.caret.row - top
+                if erow >= 0 and erow < rows and s.caret.row < buf.line_count:
+                    var ecol = s.caret.col
+                    var ell = len(buf.get_line(s.caret.row))
+                    if ecol > ell:
+                        ecol = ell
+                    var ey = self.ed_y + erow * line_h
+                    var eupto = string_slice(buf.get_line(s.caret.row), 0, ecol)
+                    var ecm = self.f_code.width(eupto)
+                    r.fill_xywh(text_x + ecm, ey + 1, 2, line_h - 2, Color(255, 255, 255, 200))
+                ei = ei + 1
         r.clear_clip()
         r.draw_line(self.col_x + self.GUTTER_W, self.ed_y, self.col_x + self.GUTTER_W, self.ed_y + self.ed_h, th.border_soft, 1)
 
@@ -1423,6 +1448,8 @@ class NythonIDE:
                 if e.consumed:
                     return
                 self.editor.handle_event(e)
+                if e.type == "textinput" or e.key == "backspace" or e.key == "enter":
+                    self._apply_to_extra_carets(e)
                 # No auto-indent here: EditorBuffer.newline() already copies the
                 # previous line's indentation and adds a level after ':'. Doing
                 # it again indented new lines twice.
@@ -1716,6 +1743,12 @@ class NythonIDE:
                     return
             var p = self._pos_at(x, y)
             var buf = self.buffers[self.active_tab]
+            if e.alt:
+                self._add_caret(p["row"], p["col"])
+                self.editor.focused = true
+                e.consume()
+                return
+            self._clear_extra_carets()
             buf.cursor_row = p["row"]
             buf.cursor_col = p["col"]
             if e.shift:
@@ -1746,6 +1779,10 @@ class NythonIDE:
         if e.key == "escape":
             if self.menu_open >= 0:
                 self.menu_open = -1
+                e.consume()
+                return true
+            if self.selmodel.count > 1:
+                self._clear_extra_carets()
                 e.consume()
                 return true
         if e.key == "k" and e.ctrl and not e.shift:
@@ -1791,6 +1828,14 @@ class NythonIDE:
             return true
         if e.key == "k" and e.ctrl and e.shift:
             self._delete_line()
+            e.consume()
+            return true
+        if e.key == "up" and e.alt and e.ctrl:
+            self._add_caret_vertical(0 - 1)
+            e.consume()
+            return true
+        if e.key == "down" and e.alt and e.ctrl:
+            self._add_caret_vertical(1)
             e.consume()
             return true
         if e.key == "up" and e.alt:
@@ -2677,6 +2722,112 @@ class NythonIDE:
         self._hl_cache_n = 0
         self.tabs[self.active_tab].dirty = true
         return true
+
+    # ══ multi-cursor ═════════════════════════════════════════════════════════
+    # Extra carets beyond the primary (buf.cursor_row/cursor_col, unchanged).
+    # Deliberately position-only, with no selection of their own — Alt+Click
+    # and Ctrl+Alt+Up/Down are the two ways real editors most commonly grow a
+    # multi-cursor set, and both only ever need a point, not a range.
+    def _sync_primary_caret(self):
+        var buf = self.buffers[self.active_tab]
+        self.selmodel.sels[0].caret.row = buf.cursor_row
+        self.selmodel.sels[0].caret.col = buf.cursor_col
+
+    def _add_caret(self, row, col):
+        self._sync_primary_caret()
+        var added = self.selmodel.add_caret(row, col)
+        if added:
+            self._dirty = true
+        return added
+
+    def _add_caret_vertical(self, delta):
+        var buf = self.buffers[self.active_tab]
+        self._sync_primary_caret()
+        # Extends from the last-added caret, not always the primary, so
+        # repeated presses walk further in the same direction.
+        var from_row = buf.cursor_row
+        var from_col = buf.cursor_col
+        if self.selmodel.count > 1:
+            var last = self.selmodel.sels[self.selmodel.count - 1]
+            from_row = last.caret.row
+            from_col = last.caret.col
+        var nrow = from_row + delta
+        if nrow < 0 or nrow >= buf.line_count:
+            return false
+        var ncol = from_col
+        var ll = len(buf.get_line(nrow))
+        if ncol > ll:
+            ncol = ll
+        var added = self.selmodel.add_caret(nrow, ncol)
+        if added:
+            self._dirty = true
+        return added
+
+    def _clear_extra_carets(self):
+        if self.selmodel.count > 1:
+            self.selmodel.clear_secondary()
+            self._dirty = true
+
+    # Replays the edit e just applied to the primary caret at every extra
+    # caret. Processed from the last caret to the first (by row, then col,
+    # descending): an insert or delete only shifts positions after it, so
+    # working backward keeps not-yet-processed carets' saved positions valid
+    # without having to recompute them. Bounds-checked against the CURRENT
+    # buffer rather than trusted outright, since a caret added before a tab
+    # switch would otherwise index past a shorter file's line count.
+    def _apply_to_extra_carets(self, e):
+        if self.selmodel.count <= 1:
+            return
+        var buf = self.buffers[self.active_tab]
+        var save_row = buf.cursor_row
+        var save_col = buf.cursor_col
+        var order = []
+        var i = 1
+        while i < self.selmodel.count:
+            if self.selmodel.sels[i].caret.row < buf.line_count:
+                order.append(i)
+            i = i + 1
+        var n = len(order)
+        var a = 0
+        while a < n:
+            var b = a + 1
+            while b < n:
+                var sa = self.selmodel.sels[order[a]]
+                var sb = self.selmodel.sels[order[b]]
+                var swap = false
+                if sb.caret.row > sa.caret.row:
+                    swap = true
+                elif sb.caret.row == sa.caret.row and sb.caret.col > sa.caret.col:
+                    swap = true
+                if swap:
+                    var t = order[a]
+                    order[a] = order[b]
+                    order[b] = t
+                b = b + 1
+            a = a + 1
+        var k = 0
+        while k < n:
+            var s = self.selmodel.sels[order[k]]
+            var crow = s.caret.row
+            var ccol = s.caret.col
+            var ll = len(buf.get_line(crow))
+            if ccol > ll:
+                ccol = ll
+            buf.cursor_row = crow
+            buf.cursor_col = ccol
+            if e.type == "textinput":
+                buf.insert_char(e.text)
+            elif e.key == "backspace":
+                buf.delete_char_back()
+            elif e.key == "enter":
+                buf.insert_newline()
+            s.caret.row = buf.cursor_row
+            s.caret.col = buf.cursor_col
+            s.anchor.row = buf.cursor_row
+            s.anchor.col = buf.cursor_col
+            k = k + 1
+        buf.cursor_row = save_row
+        buf.cursor_col = save_col
 
     # Pixel position -> (row, col), used by click and drag.
     def _pos_at(self, x, y):
