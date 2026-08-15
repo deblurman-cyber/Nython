@@ -1,3 +1,5 @@
 build/
 *.o
 ny_test
+demo_output.txt
+test_output.txt

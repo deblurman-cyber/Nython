@@ -3934,7 +3934,13 @@ public:
                                                     else if (i < fn->defaults.size() && fn->defaults[i]) fn_ctx->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
                                                     else fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
                                                 }
-                                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {} catch (...) {}
+                                                // A bare `return` inside __init__ is legitimate control
+                                                // flow (ReturnSignal) and is swallowed here; anything
+                                                // else — NameError, a user exception, IndexError — must
+                                                // propagate like it does for every other function call,
+                                                // not be silently discarded (see NythonExecutor.hpp's
+                                                // other ReturnSignal-only catches for the same pattern).
+                                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
                                                 break;
                                             }
                                         }
@@ -4172,7 +4178,9 @@ public:
                                     fn_ctx->defineByName("__parent_class__", makeStringValue(pname));
                                     fn_ctx->defineByName("__instance__", instance);
                                 }
-                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {} catch (...) {}
+                                // See the identical comment on the other __init__ call sites in
+                                // this file: only ReturnSignal (a bare `return`) is swallowed here.
+                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
                             }
                         }
                     }
@@ -4217,7 +4225,6 @@ public:
                                         }
                                         try { evalNode(fn->body, fn_ctx); }
                                         catch (nython::node::ReturnSignal&) {}
-                                        catch (...) {}
                                         break;
                                     }
                                 }
