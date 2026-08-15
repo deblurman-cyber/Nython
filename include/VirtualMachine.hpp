@@ -4859,11 +4859,25 @@ private:
         globals_["isinstance"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
             VMVal& obj=a[0]; VMVal& cls=a[1];
-            if(obj.type!=VMType::INSTANCE) return VMVal::make_bool(false);
             std::string cls_name;
             if(cls.type==VMType::CLASS) cls_name=cls.class_name;
             else if(cls.type==VMType::STRING) cls_name=cls.s;
             else return VMVal::make_bool(false);
+            if(obj.type!=VMType::INSTANCE){
+                // Builtin/primitive types by name, e.g. isinstance(42, "int").
+                // Only the class-instance case below was handled, so this
+                // always read false; mirrors the interpreter's alias set
+                // (dispatch_tensor's isinstance in src/builtins/tensor.cpp).
+                if(cls_name=="int"||cls_name=="integer") return VMVal::make_bool(obj.type==VMType::INT);
+                if(cls_name=="float"||cls_name=="double") return VMVal::make_bool(obj.type==VMType::FLOAT);
+                if(cls_name=="bool"||cls_name=="boolean") return VMVal::make_bool(obj.type==VMType::BOOL);
+                if(cls_name=="str"||cls_name=="string") return VMVal::make_bool(obj.type==VMType::STRING);
+                if(cls_name=="list"||cls_name=="array") return VMVal::make_bool(obj.type==VMType::LIST);
+                if(cls_name=="map"||cls_name=="dict") return VMVal::make_bool(obj.type==VMType::MAP);
+                if(cls_name=="none") return VMVal::make_bool(obj.type==VMType::NONE);
+                if(cls_name=="function") return VMVal::make_bool(obj.type==VMType::FUNCTION||obj.type==VMType::NATIVE);
+                return VMVal::make_bool(false);
+            }
             // Walk inheritance chain
             std::string cur=obj.class_name;
             while(!cur.empty()){
