@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: end of round 71 (see §0 for what changed).
+Last updated: end of round 71b (see §0/§0b for the language-level work,
+§5.3 for the IDE terminal command line just wired in).
 
 ---
 
@@ -437,23 +438,42 @@ functions on either engine — only the *method* form `obj.id()` worked, which
 is what this section's `objectProtocol()` already covered).
 
 ### 5.3 Built but not adopted by the shipped IDE
-Tested, working, unused by `nython_ide.ny`:
 
-| Module | What it provides |
-|---|---|
-| `lib/ide_commands.ny` | `:cmd` / `>expr` / `@agent` command line |
-| `lib/nyimgui.ny` | slider, scrollbar, panel, toolbar separator |
-| `lib/gui_piecetable.ny` | piece-table buffer with operation-based undo |
-| `lib/ide_selection.ny` | multi-cursor selection model |
-| `lib/gui_motion.ny` | `Flex` solver, easing curves, `Fuzzy` matcher |
+**`lib/ide_commands.ny` — CLOSED (round 71b)**: the `:cmd` / `>expr` /
+`@agent` terminal command line (paired with `lib/ide_toolchain.ny`'s real
+compile/run bridge) is now wired into `nython_ide.ny`'s terminal panel —
+`NythonIDE.__init__` constructs a `Toolchain` + `CommandLine`, and
+`_term_run`/`_term_dispatch`/`_term_agent`/`_term_profile` execute the
+action the command line names. `:run` `:vm` `:tokens` `:ast` `:disasm`
+`:build` reuse the existing `_build_run()` pipeline; `:save` `:open <f>`
+`:goto <n>` `:find <t>` `:panel <name>` `:theme` `:quit` reuse existing IDE
+methods; `:profile` is new — the IDE had no way to reach the profiler at
+all before this. `@explain`/`@fix` are backed by `lib/aiagent.ny`'s
+pattern-based `CodeAnalyzer` (the same one "Analyse Buffer" already used);
+`@ask`/`@test`/`@doc`/`@review` say plainly they are not wired to a live
+model rather than fabricating output. Command history (up/down) and
+tab-completion also wired. Verified: `make` builds clean, headless
+`--ide` launch exits 0 (constructor succeeds), the module's own dedicated
+test (`gui_tests/test_27_widgets_cmdline.ny`) still passes 36/36 on both
+engines. **Not verified**: the headless SDL3 stub has no synthetic
+keyboard/text-input injection, so the new terminal code paths could not be
+exercised through a real keydown/textinput sequence in this environment —
+only through static review and the construction smoke test above.
 
-Wiring the command line into the terminal panel and the panel widget into the
-bottom dock is the natural next step. Do each as its own change so a regression
-is attributable.
+Still tested, working, and unused by `nython_ide.ny`:
+
+| Module | What it provides | Notes |
+|---|---|---|
+| `lib/gui_piecetable.ny` | piece-table buffer with operation-based undo | Would replace the IDE's full-text-snapshot undo stack (`self.undo_stack` in `nython_ide.ny`, capped at 50 snapshots) — same inefficiency `MEMORY_NOTES.md` documents (373 MB → 56 MB for 400 edits). Not attempted: the piece table is offset-addressed and `EditorBuffer` (`ide_editor.ny`) is a line-list, so adopting it means rewriting every edit path in `EditorBuffer`, not a drop-in swap — real risk of editing bugs against 1053 `test_gui` assertions and no headless way to keyboard-test the result (see above). Needs its own carefully-scoped change. |
+| `lib/ide_selection.ny` | multi-cursor selection model | Same caution as above — v4 already has a single-cursor selection model (`sel_on`/`sel_row`/`sel_col`, per §4's "grep for behaviour" note); upgrading to multi-cursor touches the same wide surface. |
+| `lib/nyimgui.ny` | **Partially adopted.** `chips`/`tabs` are used (mode switcher, panel tabs). `slider`/`scrollbar`/`panel`/`toolbar_sep`/`checkbox`/`button`/`tree_node`/`icon_rail` are still unused — the IDE has its own hand-rolled scrollbars/sliders already working; per the note below, swapping them is not a clear win. |
+| `lib/gui_motion.ny` | **Partially adopted.** `Fuzzy` is used (command palette ranking, `self.fuzzy.rank(...)`). The `Flex` solver and easing curves beyond pane-open/close animation are unused. |
 
 Note: `CursorManager`, `Splitter`, `ScrollArea` and `FocusManager` in
 `lib/gui.ny` are **deliberately** unused — v4 has its own working equivalents,
 and replacing them would be churn with regression risk and no visible gain.
+The same reasoning is why `nyimgui.ny`'s `slider`/`scrollbar`/`panel` were
+left alone this round rather than swapped in speculatively.
 
 ### 5.4 Remaining engine divergences
 - `L is L` on a list: true on the interpreter, false on the VM. The VM appears to

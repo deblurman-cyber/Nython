@@ -415,6 +415,15 @@ it's no longer a divergence, the VM's `op_div()` was wrong and is fixed.
 always evaluated to `0` on the VM (`std::stoll` stopping at the prefix
 letter) — found incidentally, not part of the operator/keyword work above.
 
+## Round 71b: IDE terminal command line
+
+`nython_ide.ny`'s terminal panel now runs real commands instead of a
+four-word stub. `lib/ide_commands.ny` (`:cmd` / `>expr` / `@agent`) and
+`lib/ide_toolchain.ny` (the real popen-based compile/run bridge) are wired
+into `NythonIDE.__init__`/`_term_run`. See `HANDOFF.md` §5.3 for the full
+command list and what is still unverified (no headless keyboard injection
+to exercise it end-to-end).
+
 ## Transcripts
 
 - `/mnt/transcripts/journal.txt` — catalog of all session transcripts
