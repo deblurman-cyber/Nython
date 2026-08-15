@@ -307,8 +307,9 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
   The VM does not have this problem (it uses `shared_ptr`).
 - `len()` counts characters but `s[i]` / `s[a:b]` index bytes.
 - `1.+(2, 3)` parses but evaluates to `none` — primitives have no members.
-- Integer `/` differs between engines (`5.0` vs `5`) — a design decision, not a
-  bug; `examples/arith_test.ny` asserts the VM's answer.
+- ~~Integer `/` differs between engines~~ — **resolved (round 71)**: `/` is
+  always true division (float), `//`/`\` are floor division (int) on both
+  engines. See "Round 71 fixes" below.
 - `generator.send()` not implemented (eager-collection architecture).
 - Video builtins are stubs (need ffmpeg).
 - `@property` as decorator syntax on a class method doesn't work on the VM
@@ -374,6 +375,45 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - **`enumerate(lst, start=N)` kwarg form fixed**: Root cause was two-part —
   (1) `NythonExecutor.hpp` kw_builtins set didn't include `"enumerate"`, so `start=` was silently dropped before reaching callBuiltin; (2) a duplicate `globals_["enumerate"]` in VirtualMachine.hpp (line ~4346) overwrote the correct version that had start-support. Both fixed: `enumerate` added to kw_builtins with `start` key extraction; both VM enumerate definitions updated with full positional + kwarg start support.
 - **vm_audit27 added**: 84 tests covering the above plus *args/**kwargs, try/else, string .replace()/.count()/.join(), isinstance with inheritance, __repr__, callable classes (__call__), dict.items()/keys()/values(), chained comparisons, lambda multi-arg, map+filter, method chaining, sorted key=/reverse=, recursion, string %, dict.get(), `in` operator.
+
+## Round 71 fixes (see `HANDOFF.md` §0b for full detail)
+
+**Division, ruled**: `/` is always true division (float — `10 / 2 == 5.0`);
+`//` and `\` are floor division (int — `10 // 2 == 10 \ 2 == 5`). This
+resolves the "Integer `/` differs between engines" known limitation above —
+it's no longer a divergence, the VM's `op_div()` was wrong and is fixed.
+
+**Dead operators, now wired up on both engines** (verified with
+`examples/vm_audit35.ny`, diffed interpreter-vs-VM):
+- `instanceof` — alias for `is`.
+- `===` / `!==` — strict equality/inequality (previously corrupted the VM
+  stack as an unhandled NOP).
+- `xor` / `^^` — logical xor (same previous VM stack corruption).
+- `>>>=` — treated as `>>=` (Nython ints are arbitrary-width, no fixed sign
+  bit to distinguish logical vs arithmetic shift).
+- `~=` — bitwise-complement-assign: `x ~= y` means `x = ~y`.
+- `++` / `--` postfix — now actually mutate on the VM (were a no-op there).
+- `\` (RevDiv) — was unreachable at the lexer level; now floor-divides.
+
+**New language constructs**:
+- `enum Name: A, B, C` — members are ordinals (or explicit values); compiles
+  to a bound name→value map on both engines.
+- `namespace Name: ...` / `module Name: ...` (module is a pure alias) — now
+  binds its own name on the interpreter (`ns.member` used to read `none`);
+  now compiles on the VM at all (used to be a silently-dropped subtree).
+- `interface Name: ...` + `class C implements Name` — interface now
+  registers as a real type on both engines, so `implements` + `is`/
+  `isinstance` chain-walking sees it (interpreter used to no-op interface
+  declarations entirely; VM used to drop the subtree).
+- `struct Point: x, y=0` — desugars at parse time to a class with a
+  synthesized `__init__` that assigns each field via `self.field = field`.
+- `new A()` / `new A` — construct an instance, distinct from `A` (the class
+  value) and `A()` (call with no `new`, equivalent to `new A()` for a
+  zero-arg constructor).
+
+**Also fixed**: hex/octal/binary integer literals (`0xFF`/`0o17`/`0b1010`)
+always evaluated to `0` on the VM (`std::stoll` stopping at the prefix
+letter) — found incidentally, not part of the operator/keyword work above.
 
 ## Transcripts
 

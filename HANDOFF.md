@@ -3,7 +3,7 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: end of round 70 (see §0 for what changed).
+Last updated: end of round 71 (see §0 for what changed).
 
 ---
 
@@ -131,6 +131,119 @@ decorator syntax on the VM — pre-existing, real, not touched) and one item in
 
 ---
 
+## 0b. Round 71 — division ruling, dead operators wired up, new language constructs
+
+This round had an explicit product decision from the project owner, resolving
+the design question §5.4 had been carrying open since round 70: **`/` is
+always true division** (returns float — `10 / 2 == 5.0`, matching Python);
+**`//` and `\` are floor division** (return int — `10 // 2 == 10 \ 2 == 5`).
+The VM's `op_div()` used to special-case exact int/int division and return an
+int for `/`, contradicting the interpreter and this ruling — fixed to always
+return float for `/`. `examples/arith_test.ny`'s stale assertions were
+updated to match.
+
+The rest of the round worked through operators and keywords that exist as
+real tokens (`IToken.hpp`) and are documented in `CLAUDE.md`'s grammar notes
+but were dead at the parser, the compiler, or both — "there are many
+operators to use that are not even used." Fixed, both engines, verified with
+`examples/vm_audit35.ny` (new — diffs interpreter vs VM output line for
+line) plus the full exit-code and content-level sweeps:
+
+- **`\` (RevDiv) was completely unreachable**: the lexer's backslash
+  handling had inverted logic that only ever produced escape/line-
+  continuation tokens, never a `RevDiv` token, regardless of context.
+  Restructured to check for line-continuation (backslash immediately before
+  a newline) first, and emit `RevDiv` otherwise.
+- **`instanceof`**: unimplemented on the interpreter (silently evaluated to
+  `none`), and a stack-leaking NOP on the VM (left both operands on the
+  stack, corrupting everything compiled after it). Now a true alias for
+  `is` on both engines, including the VM's compile-time type-name special
+  case (`COMPARE_IS_TYPE`) that `is` already had — needed separately, since
+  aliasing the runtime opcode alone wasn't enough for `x instanceof SomeType`
+  to resolve `SomeType` as a type name rather than a value comparison.
+- **`===` / `!==` (strict equality) and `xor` / `^^`**: same stack-
+  corrupting NOP pattern on the VM. Added dedicated `COMPARE_SEQ` /
+  `COMPARE_SNE` / `LOGICAL_XOR` opcodes; the interpreter already handled
+  these correctly.
+- **`>>>=`**: silently degraded to a plain assignment (`x >>>= 2` set `x` to
+  `2`) on both engines. Now treated as equivalent to `>>=` — Nython's
+  integers are arbitrary-width, so there is no fixed-width sign bit to make
+  "unsigned" vs "arithmetic" shift meaningfully different; documented as a
+  judgment call, not a distinct semantic.
+- **`~=`**: not parseable at all (`isAugAssign()` didn't recognise
+  `ComplementAssign`). Added, and implemented as `x = ~y` (bitwise-complement
+  the right-hand value and assign — the left operand's old value plays no
+  part, matching the "complement in place" reading of every other
+  `~`-family use in the language). The VM needed a dedicated compile path
+  since it doesn't fit the generic load/binary-op/store pattern every other
+  compound assignment uses.
+- **VM postfix `++` / `--`**: compiled to a no-op (`UNARY_POS`), so `i++`
+  parsed but did nothing. Now emits a load/dup/add-or-subtract-1/store
+  sequence matching the interpreter's post-increment semantics (evaluates
+  to the *old* value, writes back the new one).
+- **`enum` / `namespace` / `interface`**: the VM compiler silently dropped
+  these entire subtrees — unmatched `visit()` cases fell to a `default:`
+  that emitted nothing. All three now compile for real (enum → a map of
+  member name to ordinal-or-explicit-value; namespace → a map of the
+  block's top-level declarations, bound under the namespace's own name;
+  interface → compiled identically to a class, so `implements`/`is` see it
+  as a real type in the inheritance chain). Confirmed `package` is
+  correctly a no-op on both engines already (matches `PackageNode::eval()`
+  on the interpreter — nothing to fix there).
+- **Interpreter `namespace` never bound its own name**: `ns.member` always
+  read `none ` because `evalNamespace()` evaluated the body and threw the
+  result away. Now builds a member map from the namespace's top-level
+  var/function/class declarations and binds it under the namespace's name,
+  same shape as the VM's new namespace compilation above.
+- **Interpreter `interface` was an explicit no-op**: `case
+  NodeType::INTERFACE: return NONE_VALUE;` bypassed `InterfaceNode`'s own
+  (already-working) `eval()` entirely. Routed through a new
+  `evalInterfaceDecl()`, registered exactly like a class, so `implements`
+  plus `is`/`isinstance` chain-walking actually sees interface types.
+- **`new` had no parser production**: `new A()` and `new A` both silently
+  discarded the `new` token and whatever followed enough to keep parsing,
+  with no distinct behaviour from bare `A()`/`A`. Added a dedicated rule in
+  `unary()` that gives all four forms their own, distinct meaning: `A` is
+  the class value itself; `A()` calls it with no `new`; `new A()` and
+  `new A` both construct an instance (with and without explicit empty
+  parens) — `new` and bare-call construction are equivalent for a
+  zero-arg constructor, which is the existing convention every other
+  callable in the language already follows.
+- **`struct` was entirely missing** (no token, no grammar). Added as a new
+  keyword that desugars at *parse time*: `struct Point: x, y=0` becomes a
+  synthesized `class Point: def __init__(self, x, y=0): self.x=x; self.y=y`
+  — no new evaluation code needed on either engine, since it reuses the
+  existing class machinery entirely. The first implementation used a plain
+  `VariableNode` for the generated body's `self` reference and passed on
+  the interpreter but silently read `none` for every field on the VM —
+  traced via `--disasm` to the VM compiling `self.x` through a distinct
+  `SelfNode` → `LOAD_SELF` opcode, which a same-named ordinary variable
+  node doesn't get (the VM has no bound local literally named `"self"` to
+  fall back to). Fixed by generating a real `SelfNode`, not a
+  `VariableNode`, for the synthesized body.
+- **`module` was entirely missing**. Added as a pure lexer-level alias for
+  `namespace` (same `TokenType::NameSpace`, a second literal spelling) —
+  confirmed via grep that no existing file in the corpus uses `module` as a
+  bare identifier, so there is no collision risk.
+- **Hex/octal/binary integer literals evaluated to `0` on the VM**
+  (`0xFF`, `0o17`, `0b1010`) — found incidentally while investigating sweep
+  counts, not part of the operator/keyword work above, but the same class
+  of "dead code path" bug. `NT::INTEGER` compilation called
+  `std::stoll(token.value)` directly, which stops parsing at the `x`/`o`/`b`
+  and returns `0` for the digits-only prefix. Added `parse_int_literal()`,
+  mirroring the interpreter's existing correct prefix-detection logic, used
+  at both `NT::INTEGER` compile sites (the literal itself, and default-value
+  folding).
+
+Net result: the design-decision half of §5.4 is now closed (see below); the
+"many operators … not even used" and "interface, enum, struct, module,
+namespace … packages" requests are substantially done — the remaining gap is
+multiple inheritance / multiple `implements` beyond `bases[0]`, not tracked
+by either engine, and `block:` not opening its own scope (still open, not
+addressed this round).
+
+---
+
 ## 1. Current state
 
 ```
@@ -148,6 +261,10 @@ round (see §5.1 for why: a mistake there is a use-after-free, not a test
 failure, and needs its own ASan-verified change). The VM now runs this same
 file **to completion** (§0) — it was the `nytorch_classes` no-op, not the
 container leak, that was failing it before.
+
+Round 71 (§0b) added `examples/vm_audit35.ny` and re-ran the full exit-code
+and content-level sweeps afterward: still exactly the one known failure
+above, nothing new.
 
 ---
 
@@ -342,10 +459,12 @@ and replacing them would be churn with regression risk and no visible gain.
 - `L is L` on a list: true on the interpreter, false on the VM. The VM appears to
   copy list values on load. Deeper than the `is` operator.
 - `print is function`: the engines classify native builtins differently.
-- Integer `/`: `5.0` on the interpreter, `5` on the VM. **A language-design
-  decision, not a bug** — `examples/arith_test.ny` asserts the VM's answer while
-  the interpreter contradicts it. Needs an owner's ruling.
-- Similarly undecided: dict/set iteration order, tuples (the VM has no tuple
+- ~~Integer `/`: `5.0` on the interpreter, `5` on the VM~~ — **CLOSED (round
+  71)**: owner's ruling is `/` is always true division (float,
+  `10 / 2 == 5.0`), `//` and `\` are floor division (int, `10 // 2 == 10 \
+  2 == 5`). VM's `op_div()` no longer special-cases exact int/int division;
+  `examples/arith_test.ny` updated to match. See §0b.
+- Still undecided: dict/set iteration order, tuples (the VM has no tuple
   type), `undefined` vs `none`, out-of-range indexing (interpreter throws, VM
   returns `none`).
 
@@ -467,7 +586,8 @@ method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 
 | File | Covers |
 |---|---|
-| `examples/vm_audit28`–`33.ny` | engine parity for language fixes |
+| `examples/vm_audit28`–`34.ny` | engine parity for language fixes |
+| `examples/vm_audit35.ny` | division ruling, instanceof/===/!==/xor/>>>=/~=, postfix ++/--, enum/namespace/module/interface/struct/new, hex/oct/binary literals (round 71) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
 | `gui_tests/test_15` | cursor manager, value inspector, Unicode |
