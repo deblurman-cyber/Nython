@@ -103,23 +103,31 @@ Fixed, both engines unless noted (see git log for the individual commits):
   form the interpreter has always had — hit `tensor_clip`'s "must be a list"
   guard and returned `[]`. Split them; `clamp` is now the scalar builtin,
   `tensor_clip` keeps the list behaviour under its own name.
-- **VM object protocol** (§5.2, VM half): ported `class_name`/`type_name`/
+- **VM object protocol** (§5.2, closed): ported `class_name`/`type_name`/
   `to_string`/`id`/`hash`/`is_a`/`instance_of`/`equals_to`/`fields` to
   `vm_call_method`, mirroring the interpreter's `objectProtocol`. This is
   exactly the interface `test_25_object_protocol.ny` probes for and used to
-  skip on the VM. **Not done**: the interpreter's protocol lives in one
-  function and was straightforward to mirror; nothing here touches the deeper
-  gaps in §5.9 (property descriptors, typed `except`), which are a different
-  and larger kind of VM/interpreter divergence.
+  skip on the VM.
+- **VM typed `except` and `try`/`else`** (§5.9, closed): `ExceptionEntry` held
+  one handler total, so only the *first* `except` clause's body was even
+  compiled — every clause after it was dead code, and which one ran had
+  nothing to do with the raised exception's type. Rewrote it to hold one
+  `{type_name, bind_var, handler}` per clause plus an `else_handler`, with a
+  new `match_except_handler()` doing the type walk at runtime (mirroring the
+  interpreter's `evalTry`). `vm_audit24` now passes 49/49. See §5.9 for the
+  two further bugs this closure surfaced — `int()` never raising and a
+  genuine infinite loop it exposed in `with`'s exception handling — both also
+  fixed, and why that combination is worth reading if you're touching VM
+  exception handling again.
 - **Stale test**: `vm_audit25`'s "neg modulo" still asserted the pre-fix
   C-style `-7 % 3 == -1`. `CLAUDE.md` documents this was deliberately changed
   to floor-modulo (`== 2`) rounds ago; the assertion was never updated to
   match. Fixed in both the `examples/` and `tests/` copies.
 
 Net result — every suite in `CLAUDE.md`'s 24-suite table now matches its
-documented count **on both engines**, except the two items in §5.9 (both
-pre-existing, both real, neither touched this round) and the one item in §5.4
-that is a design decision, not a bug (`5.0` vs `5` for `10 / 2`).
+documented count **on both engines**, except one item in §5.9 (`@property`
+decorator syntax on the VM — pre-existing, real, not touched) and one item in
+§5.4 that is a design decision, not a bug (`5.0` vs `5` for `10 / 2`).
 
 ---
 
@@ -392,16 +400,53 @@ file — it just hasn't been given it yet. Left alone this round rather than
 fixed blind, given the volume (~50 individual assertions across ~35 files)
 and the risk of a wrong fix in a file nobody has looked at closely before.
 
-### 5.9 Two more VM/interpreter divergences found this round, not fixed
+### 5.9 VM/interpreter divergences found this round
 
-Both are architectural gaps in how the VM compiles/dispatches, not surface
-bugs — same risk class as §5.1, scoped out of this round for the same reason
-(a rushed fix here is more likely to be subtly wrong than visibly broken).
+**Typed `except`, `try`/`else`, and `int()` raising — CLOSED (round 70, second pass).**
+`ExceptionEntry` used to be `{try_start, try_end, handler, alias}` — one
+handler total — so only the *first* `except` clause's body was even
+compiled; every clause after it was dead code, and which one ran had nothing
+to do with the raised exception's type (`vm_audit24`'s "typed except type":
+raising `TypeError` was caught by the `except ValueError` clause). `try`/`else`
+wasn't compiled at all and read `none`. Rewrote `ExceptionEntry` to hold one
+`{type_name, bind_var, handler}` per clause plus an `else_handler`, and added
+`match_except_handler()` to pick the right one at runtime — by type equality,
+the generic `Exception`/`BaseException`/`Error` names, or a walk up the raised
+type's parent chain via `class_reg_` — mirroring the interpreter's `evalTry`
+(`NythonExecutor.hpp`), including its behaviour when *no* clause matches
+(silently falls through to `finally` rather than re-raising). `vm_audit24` now
+passes 49/49.
 
-**`@property`-decorated class methods don't work on the VM.** `x = property(x)`
-written as an explicit call (`self.x = property(getter)`) works — `get_attr`
-checks for a `{__is_property__: ...}` map and calls `__get__`. But
-`@property` as *decorator syntax* on a class method desugars at parse time to
+Fixing this exposed two more real bugs on the way to green, both worth noting
+because of what they reveal about testing this codebase:
+- **`int(s)` on the VM silently returned `0`** for anything `std::stoll`
+  couldn't parse, instead of raising — `int("abc")` looked like a successful
+  parse of `0`, not an error a `try`/`except` could catch. It also never
+  supported the base argument or `0x`/`0b`/`0o` prefix auto-detection. Brought
+  to parity with the interpreter's `int()` (`src/builtins/tensor.cpp`).
+- **Fixing `int()` to actually raise surfaced an independent, older bug that
+  was previously unreachable**: an uncaught exception raised anywhere after a
+  completed `with` block, with nothing else to catch it, walked backward into
+  that block's now-stale `SETUP_EXCEPT` handler instead of propagating — the
+  backward scan for a `with`'s exception handler never checked whether that
+  block had already exited normally via a matching `END_EXCEPT`. This re-ran
+  the code after the `with` block, hit the same raise again, and **looped
+  forever** (`examples/v10_final_test.ny` and `v11_complete_test.ny` hung on
+  `--vm` for the first time only once `int()` started raising). Fixed by
+  tracking `SETUP_EXCEPT`/`END_EXCEPT` nesting depth in the backward scan.
+  This is exactly why §3's "run the full sweep before *and* after" matters: a
+  fix that is locally correct (`int()` raising is right) can awaken a
+  completely unrelated latent bug the moment something finally exercises the
+  path it lives on. Verified with a full exit-code sweep (no hangs, no new
+  crashes) and a full content-level sweep (no new `N failed` files) across
+  every example/test file on both engines before committing.
+
+**`@property`-decorated class methods still don't work on the VM.** Not
+attempted — an architectural gap in a different part of the compiler, same
+risk class as §5.1. `x = property(x)` written as an explicit call
+(`self.x = property(getter)`) works fine — `get_attr` checks for a
+`{__is_property__: ...}` map and calls `__get__`. But `@property` as
+*decorator syntax* on a class method desugars at parse time to
 `name = property(name)` as a synthesized assignment following the `def`
 (`src/Parser.cpp`, the general decorator path) — and the VM's class compiler
 (`visit_class`/`visit_func`) doesn't execute class bodies as a live sequence
@@ -409,28 +454,12 @@ of statements the way the interpreter does; it extracts `FUNCTION` nodes
 straight into `sub_codes` and has no mechanism for a later statement to
 retroactively mark one of them as a property. `obj.decorated_prop` returns the
 raw `{__self__:..., __fn__:...}` bound-method map instead of calling it
-(`vm_audit23`'s "property fahrenheit", `vm_audit25`'s "prop area"/"prop circ").
+(`vm_audit23`'s "property fahrenheit", `vm_audit25`'s "prop area"/"prop circ" —
+these are now the *only* remaining failures in either file on either engine).
 A real fix needs the compiler to recognize the `name = property(name)`
 pattern immediately after a same-named method definition, at class-compile
 time, and tag that `sub_codes` entry — touching class compilation and every
 method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
-
-**Typed `except` clauses don't discriminate by exception type on the VM.**
-`ExceptionEntry` (`try_start, try_end, handler, alias`) carries no type
-information at all, so `except ValueError as e: ...` / `except TypeError as
-e: ...` / `except as e: ...` in sequence all just... whichever the VM's
-handler-selection logic picks, which in practice is always the *first*
-handler after the `try`, regardless of the raised exception's actual type
-(`vm_audit24`'s "typed except type": raising `TypeError` is caught by the
-`except ValueError` clause). Fixing this needs the compiler to record a type
-per handler and the runtime dispatch to actually compare it against the
-raised exception's type before choosing a handler — not attempted here.
-
-Also observed in passing, same underlying cause as the typed-except gap:
-`try`/`else` (the block that runs only if the `try` body did **not** raise)
-returns `none` on the VM instead of running (`vm_audit27`'s three "try/else
-*" failures) — the VM appears to have no `else`-clause handling in its
-exception-table compilation at all, independent of typing.
 
 ---
 

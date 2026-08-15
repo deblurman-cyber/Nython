@@ -279,6 +279,12 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - ~~VM: `import nytorch_classes`~~ was a no-op — the native `tensor_*` ops
   were registered, but the Nython-level class library (`Tensor`, …) was never
   actually loaded, unlike on the interpreter.
+- ~~VM: typed `except` / `try`/`else`~~ — only the first `except` clause was
+  ever compiled, regardless of its declared type; `else` wasn't compiled at
+  all. See HANDOFF 5.9.
+- ~~VM: `int(s)` never raised~~ — `int("abc")` silently returned `0` instead
+  of a catchable `ValueError`, and the base argument / `0x`/`0b`/`0o` prefix
+  auto-detection were never implemented.
 
 ### Added
 
@@ -306,9 +312,8 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - `generator.send()` not implemented (eager-collection architecture).
 - Video builtins are stubs (need ffmpeg).
 - `@property` as decorator syntax on a class method doesn't work on the VM
-  (the explicit `x = property(getter)` form does). Typed `except` clauses and
-  `try`/`else` don't discriminate/run correctly on the VM either — see
-  HANDOFF 5.9. All three are interpreter-only-correct, not yet ported.
+  (the explicit `x = property(getter)` form does) — see HANDOFF 5.9.
+  Interpreter-only-correct, not yet ported.
 
 ## Session Workflow
 
