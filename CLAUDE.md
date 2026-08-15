@@ -61,13 +61,16 @@ nython/
 ├── examples/                 ← 356 example scripts
 ├── examples/gui_tests/       ← test_13 … test_27, GUI/IDE/language regressions
 ├── tests/                    ← test suites
+├── thirdparty/sdl3-stub/     ← headless SDL3/SDL3_ttf/SDL3_image stand-in;
+│                                Makefile uses it automatically when no real
+│                                SDL3 is found (see "Development environment")
 ├── HANDOFF.md                ← START HERE when resuming
 ├── FIXES_v0.2.1.md           ← round-by-round log: every bug and why
 ├── GC_NOTES.md               ← the container leak: diagnosis and three fixes
 ├── MEMORY_NOTES.md           ← writing Nython the runtime can afford
 ├── IDE_FILES.md              ← which IDE file is real (this has bitten before)
 ├── nython.cbp                ← Code::Blocks project (SDL3 pre-configured)
-├── Makefile                  ← Linux build (SDL3 always required)
+├── Makefile                  ← Linux build (real SDL3 or the headless stub)
 ├── SDL3_SETUP.md             ← Step-by-step SDL3 setup guide
 └── CLAUDE.md                 ← this file
 ```
@@ -81,10 +84,15 @@ make            # Build IDE binary (SDL3 required)
 ./build/nython-cli --ide   # Launch IDE
 ```
 
-SDL3 is always required. Install dependencies:
+Real SDL3 is used when found (`sdl3-config`/`pkg-config`, or the usual header
+paths); otherwise the Makefile falls back automatically to the headless stub
+under `thirdparty/sdl3-stub/` (see "Development environment" below) — no
+manual step needed either way. Install real SDL3 with:
 ```bash
 apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev
 ```
+Force one or the other with `NYTHON_SDL_STUB=1` (stub) / `=0` (real, fails
+loudly if not found) if auto-detection picks the wrong one.
 
 ### Windows (Code::Blocks)
 - `.cbp` is pre-configured with SDL3 include/lib paths to `C:\SDL3\`
@@ -94,14 +102,15 @@ apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev
 
 ### Development environment (no SDL3 available)
 
-The dev container has no SDL3 and cannot install it. A headless stub in
-`/home/claude/work/stub/` provides the 111 SDL symbols the project uses, so
-everything builds and every GUI/IDE test runs without a display.
+Most dev/CI containers have no SDL3 and can't install it. The headless stub
+committed at `thirdparty/sdl3-stub/` provides the SDL/SDL_ttf/SDL_image
+surface `src/builtins/gui.cpp` actually calls, so everything builds and every
+GUI/IDE test runs without a display — the Makefile picks it automatically.
 
 ```bash
-rm -rf /tmp/vbuild && /tmp/vbuild.sh     # ~5 minutes
-cp /tmp/vbuild/nython ./ny_test
-NY_STUB_AUTOQUIT=120 ./ny_test nython_ide.ny    # IDE runs and exits cleanly
+rm -rf build && make cli && make        # ~2-3 minutes total
+cp build/nython-cli ./ny_test
+NY_STUB_AUTOQUIT=120 ./build/nython --ide    # IDE runs and exits cleanly
 ```
 
 `NY_STUB_AUTOQUIT=<n>` makes the stub deliver one quit event after *n* empty
@@ -253,6 +262,23 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - ~~32-bit integer overflow~~ — results were computed at full width and then
   truncated by a cast to `(int)`. `100000 * 100000` is now correct.
 - `**` no longer demotes exact integers to double below 2^63.
+- ~~EOF errors report `stdin:1:1`~~ — the lexer's `End` token always carried the
+  right position; the parser just discarded it once it read past the last real
+  token. Fixed in `Lexer::next()`/`curr()` (HANDOFF 5.6, closed).
+- ~~`id()`/`hash()` as global functions~~ — registered as recognised builtins but
+  never actually dispatched on either engine (`id(x)` read `undefined`/`0`
+  regardless of `x`). The *method* form `obj.id()` (object protocol) already
+  worked; the bare function form didn't.
+- ~~VM: `//=` `**=` `&=` `|=` `^=` `<<=` `>>=`~~ — only `+= -= *= /= %=` were
+  wired to an opcode; the rest silently NOP'd, so e.g. `x //= 5` replaced `x`
+  with `5` (the divisor) instead of `x // 5`.
+- ~~VM: `isinstance(x, list)`~~ (the bare builtin, not the string `"list"`) —
+  always read `false`; only `isinstance(x, "list")` worked.
+- ~~VM: `case _:`~~ — compiled as a comparison against an undefined variable
+  named `_` instead of an always-match wildcard, so it never ran.
+- ~~VM: `import nytorch_classes`~~ was a no-op — the native `tensor_*` ops
+  were registered, but the Nython-level class library (`Tensor`, …) was never
+  actually loaded, unlike on the interpreter.
 
 ### Added
 
@@ -262,9 +288,9 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 | `is` / `is not` | membership: `1 is int`, `1 is Object`, `c is Base` (walks the chain) |
 | `import X as Y` | binds a namespace; `from "m" import n` also works |
 | `catch` | alias for `except`, matching the existing `throw`/`raise` alias |
-| Located errors | `file:line:column`, source line, caret — both engines.<br>Mid-file only: an error at EOF still reports `stdin:1:1` (see HANDOFF 5.6). |
+| Located errors | `file:line:column`, source line, caret — both engines, including EOF. |
 | `NameError` / `ImportError` | undefined calls and missing modules were silent |
-| Object protocol | `class_name`, `to_string`, `is_a`, `fields`, … (**interpreter only**) |
+| Object protocol | `class_name`, `to_string`, `id`, `hash`, `is_a`, `instance_of`, `equals_to`, `fields`, … — both engines |
 | `--profile` | real per-function counts and self/total time |
 | `gui_hash_id` | native FNV-1a for immediate-mode widget identity |
 | `gui_display_scale` | HiDPI content scale |
@@ -273,21 +299,27 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 
 - **Containers are never reclaimed by the interpreter** — see `GC_NOTES.md`.
   The VM does not have this problem (it uses `shared_ptr`).
-- The object protocol is implemented on the interpreter only; the VM has no
-  equivalent and `test_25` skips there.
 - `len()` counts characters but `s[i]` / `s[a:b]` index bytes.
 - `1.+(2, 3)` parses but evaluates to `none` — primitives have no members.
 - Integer `/` differs between engines (`5.0` vs `5`) — a design decision, not a
   bug; `examples/arith_test.ny` asserts the VM's answer.
 - `generator.send()` not implemented (eager-collection architecture).
 - Video builtins are stubs (need ffmpeg).
+- `@property` as decorator syntax on a class method doesn't work on the VM
+  (the explicit `x = property(getter)` form does). Typed `except` clauses and
+  `try`/`else` don't discriminate/run correctly on the VM either — see
+  HANDOFF 5.9. All three are interpreter-only-correct, not yet ported.
 
 ## Session Workflow
 
 1. **Read `HANDOFF.md`** — environment, traps, outstanding work.
-2. Build (`rm -rf /tmp/vbuild && /tmp/vbuild.sh`), copy to `./ny_test`.
+2. Build (`rm -rf build && make cli && make`), copy the CLI binary to
+   `./ny_test` (some GUI tests shell out to it — see HANDOFF §2). No SDL3
+   install needed; `thirdparty/sdl3-stub/` is used automatically when no real
+   SDL3 is found.
 3. Run the full sweep on **both engines** before changing anything, so any
-   failure afterwards is attributable.
+   failure afterwards is attributable. Grep the *output* for `N failed`, not
+   just the exit code — see HANDOFF §2/§3.
 4. Reproduce a defect minimally, trace it to source, fix **both engines
    together**, and add a test asserting values rather than termination.
 5. Re-run the sweep and compare divergence *sets* against
