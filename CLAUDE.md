@@ -444,6 +444,35 @@ storage swap was rejected in favor of adopting its technique instead) and
 documented limitations (multi-caret edits aren't one undo step; arrow keys
 move only the primary caret).
 
+## Round 72: nytorch gets real autograd, and a genuine VM closure bug
+
+`lib/nytorch/autograd.ny` is new — a `Variable` class implementing actual
+reverse-mode automatic differentiation (dynamic computation graph +
+`.backward()` via reverse topological sort), scoped to scalars and 1D
+tensors. Nothing in nytorch had this before; every optimizer in
+`optimizers.ny` takes `grads` as an argument the caller must already have
+computed by hand. `LinearVar` + `mse_loss` + `SGDVar` show it end to end —
+`examples/vm_audit38.ny` trains one for 50 SGD steps and asserts the loss
+collapses to `0.0`, verified against hand-derived AND numerical
+(finite-difference) gradients on both engines.
+
+Building it found two real bugs:
+- **VM**: a closure stored in an instance attribute and invoked as
+  `obj.attr()` (exactly the shape `out._backward_fn = _bw; ...;
+  node._backward_fn()` uses) silently lost every captured variable —
+  `vm_call_method`'s "bare FUNCTION held in an attribute" path called
+  `exec_code(held.code, args, obj)` without `held.closure_env`, unlike every
+  other call path. The interpreter never had this bug.
+- **`activations.ny`**: `Tensor.relu()`/`.sigmoid()`/`.gelu()`/`.silu()`/
+  `.swish()`/`.elu()`/`.softmax()` each call a bare global function of the
+  *same name* as the method — which resolves back to the method itself, not
+  the builtin (the interpreter's own `RecursionError` message names this
+  exact gotcha). All seven were silently wrong on both engines; only
+  `Tensor.tanh()` had already dodged it via its builtin's other name,
+  `tanh_fn`.
+
+See `HANDOFF.md` §0c for full detail.
+
 ## Transcripts
 
 - `/mnt/transcripts/journal.txt` — catalog of all session transcripts

@@ -3,9 +3,10 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: end of round 71c (see §0/§0b for the language-level work,
+Last updated: end of round 72 (see §0/§0b for the language-level work,
 §5.3 for the IDE terminal command line, operation-based undo, and
-multi-cursor editing wired in across rounds 71b/71c).
+multi-cursor editing wired in across rounds 71b/71c, §0c for nytorch's new
+autograd engine and the VM closure bug it surfaced).
 
 ---
 
@@ -243,6 +244,64 @@ namespace … packages" requests are substantially done — the remaining gap is
 multiple inheritance / multiple `implements` beyond `bases[0]`, not tracked
 by either engine, and `block:` not opening its own scope (still open, not
 addressed this round).
+
+---
+
+## 0c. Round 72 — nytorch gets real autograd, and a genuine VM closure bug
+
+`lib/nytorch/autograd.ny` is new: a `Variable` wrapper implementing actual
+reverse-mode automatic differentiation — a dynamic computation graph built
+as operations run, and `.backward()` walking it in reverse topological
+order to accumulate `d(output)/d(x)` into `x.grad`. This is the mechanism
+the word "autograd" in "PyTorch breadth: autograd... absent" (§5.5) refers
+to, and nothing in nytorch's ~15,000 existing lines had it — every
+optimizer in `optimizers.ny` (`AdamW`, `AdaGrad`, `RMSProp`, `NAdam`,
+`Lion`) takes `grads` as an argument the *caller* must already have worked
+out by hand. Scoped deliberately to scalars and 1D tensors (the same flat
+representation `Tensor` in `activations.ny` already uses — real ND tensor
+support doesn't exist, per §5.5, and this doesn't add it). `LinearVar` +
+`mse_loss` + `SGDVar` are included as a minimal real layer/loss/optimizer
+triple. Verified by `examples/vm_audit38.ny`: hand-derived gradients for
+every op, a shared-Variable-used-twice case, vector dot/sum/mean, numerical
+gradient checking via finite differences against a composed expression
+(the strongest available check — a wrong derivative rule trains silently
+in the wrong direction rather than crashing), and an end-to-end 50-step SGD
+run whose loss collapses to exactly `0.0` on both engines.
+
+Building it surfaced a real, previously-unknown **VM bug**: `vm_call_method`'s
+path for "a callable stored in an instance attribute... then `self.cb(a,
+b)`" — exactly the shape every `Variable` op uses (`out._backward_fn = _bw`,
+called later as `node._backward_fn()`) — called `exec_code(held.code, args,
+obj)` without passing `held.closure_env`, unlike every other call path in
+the same file. A closure stored as an attribute and invoked via `obj.attr()`
+therefore silently lost every variable it had captured (they read back as
+`none`), while the *same* closure called through a plain local reference
+(`f = obj.attr; f()`) worked correctly — confirmed with a minimal repro
+before trusting the fix. The interpreter never had this bug. Fixed in
+`VirtualMachine.hpp` by threading `held.closure_env` through.
+
+Also found and fixed, same root cause, in the **already-shipped**
+`activations.ny`: `Tensor.relu()`/`.sigmoid()`/`.gelu()`/`.silu()`/
+`.swish()`/`.elu()`/`.softmax()` each call a bare global function of the
+*same name* as the method itself (e.g. `def relu(self): return
+tensor_apply(self.data, lambda v: relu(v))`). A bare call inside a method
+resolves back to that method, not the builtin, on both engines — the
+interpreter's own `RecursionError` message even names this exact gotcha
+("check for unintended self-recursion, e.g. a method with the same name as
+a builtin"). All seven methods were silently wrong (either a stack
+overflow or `none` per element, depending on the call path) before this.
+`Tensor.tanh()` had already dodged it by calling the builtin under its
+other name, `tanh_fn`; the rest now get small differently-named helpers
+(`_relu_bi`, `_sigmoid_bi`, …). `autograd.ny`'s own `exp`/`log`/`relu`/
+`sigmoid` were written with the identical latent bug and fixed the same
+way before being trusted. No existing test asserted the old (wrong) output
+— the one file calling these methods directly, `test_nytorch3.ny`, is an
+unassertive print-dump predating the `vm_audit` convention.
+
+Verified: `rm -rf build && make cli && make`, headless `--ide` launch exits
+0, full exit-code sweep (one known pre-existing failure) and full
+content-level sweep (53 known pre-existing failures, all matching §5.8/
+§5.9's already-documented debt — nothing new) on both engines.
 
 ---
 
@@ -542,9 +601,14 @@ left alone this round rather than swapped in speculatively.
 - `1.+(2, 3)` parses (operators are legal member names) but evaluates to `none` —
   integers have no `+` member. Needs primitives boxed or dispatched to a root
   type.
-- PyTorch breadth: autograd, real ND tensors, GPU dispatch and most of `torch.nn`
-  are absent. Names match PyTorch where the capability exists (`L1Loss`,
-  `SmoothL1Loss`, `LRScheduler`, `ExponentialLR`, …).
+- PyTorch breadth: real ND tensors and GPU dispatch are absent, and most of
+  `torch.nn` beyond activations/losses/a handful of layers is thin. Names
+  match PyTorch where the capability exists (`L1Loss`, `SmoothL1Loss`,
+  `LRScheduler`, `ExponentialLR`, …). ~~autograd absent~~ — **partially
+  closed, round 72**: `lib/nytorch/autograd.ny`'s `Variable`/`.backward()` is
+  a real reverse-mode automatic differentiation engine (dynamic graph +
+  topological sort), scoped to scalars and 1D tensors — see §0c. Extending
+  it to real ND tensors needs the ND tensor gap above closed first.
 
 ### 5.6 End-of-input errors lose their location — CLOSED (round 70)
 
@@ -657,6 +721,7 @@ method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 | `examples/vm_audit35.ny` | division ruling, instanceof/===/!==/xor/>>>=/~=, postfix ++/--, enum/namespace/module/interface/struct/new, hex/oct/binary literals (round 71) |
 | `examples/vm_audit36.ny` | `EditorBuffer` operation-based undo/redo (round 71c) |
 | `examples/vm_audit37.ny` | multi-cursor typing algorithm, `EditorBuffer` + `SelectionModel` (round 71c) |
+| `examples/vm_audit38.ny` | `lib/nytorch/autograd.ny` reverse-mode autodiff, hand-derived + numerical gradient checks, end-to-end SGD convergence (round 72) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
 | `gui_tests/test_15` | cursor manager, value inspector, Unicode |
