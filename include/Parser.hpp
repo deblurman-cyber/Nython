@@ -218,6 +218,7 @@ private:
     node_ptr blockStmt();
     node_ptr interfaceDecl();
     node_ptr namespaceDecl();
+    node_ptr structDecl();
     node_ptr block();
     node_ptr blockOrStmt();
     std::vector<node_ptr> paramList();

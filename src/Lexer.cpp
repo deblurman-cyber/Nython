@@ -52,7 +52,7 @@ std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::BinAndAssign,"BinAndAssign"},{TokenType::ComplementAssign,"ComplementAssign"},{TokenType::ShiftAssign,"ShiftAssign"},
 	{TokenType::ShiftLeftAssign,"ShiftLeftAssign"},{TokenType::ShiftRightAssign,"ShiftRightAssign"},{TokenType::BraceOpen,"BraceOpen"},
 	{TokenType::BraceClose,"BraceClose"},{TokenType::Comma,"Comma"},{TokenType::Colon,"Colon"},{TokenType::Dot,"Dot"},{TokenType::SemiColon,"SemiColon"},
-	{TokenType::BracketOpen,"BracketOpen"},{TokenType::BracketClose,"BracketClose"},{TokenType::ParenOpen,"ParenOpen"},{TokenType::Regex,"Regex"},{TokenType::New,"New"},
+	{TokenType::BracketOpen,"BracketOpen"},{TokenType::BracketClose,"BracketClose"},{TokenType::ParenOpen,"ParenOpen"},{TokenType::Regex,"Regex"},{TokenType::New,"New"},{TokenType::Struct,"Struct"},
 	{TokenType::ParenClose,"ParenClose"},{TokenType::At,"At"},{TokenType::RightArrow,"RightArrow"},{TokenType::LeftArrow,"LeftArrow"},{TokenType::Var,"Var"},{TokenType::Block,"Block"},
 	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"}
 };
@@ -71,6 +71,10 @@ static const TokenDef KeywordTokens[] = {
 	TokenDef(TokenType::Interface, std::string("interface"), TokenKind::Name, TokenClass::Keyword),
 	TokenDef(TokenType::Package, std::string("package"), TokenKind::Name, TokenClass::Keyword),
 	TokenDef(TokenType::NameSpace, std::string("namespace"), TokenKind::Name, TokenClass::Keyword),
+	// `module` was not a keyword at all (distinct from import/namespace/
+	// package) - a second spelling for `namespace`, the closest existing
+	// concept, rather than a fourth parallel grouping construct.
+	TokenDef(TokenType::NameSpace, std::string("module"), TokenKind::Name, TokenClass::Keyword),
 	TokenDef(TokenType::Enum, std::string("enum"), TokenKind::Name, TokenClass::Keyword),
 	TokenDef(TokenType::Use, std::string("use"), TokenKind::Name, TokenClass::Keyword),
 	TokenDef(TokenType::Abstract, std::string("abstract"), TokenKind::Name, TokenClass::Keyword),
@@ -142,6 +146,7 @@ static const TokenDef KeywordTokens[] = {
 	TokenDef(TokenType::Fn,std::string("fn"), TokenKind::Fn, TokenClass::Keyword),
 	TokenDef(TokenType::Fn,std::string("func"), TokenKind::Fn, TokenClass::Keyword),
 	TokenDef(TokenType::New,std::string("new"), TokenKind::Fn, TokenClass::Keyword),
+	TokenDef(TokenType::Struct,std::string("struct"), TokenKind::Fn, TokenClass::Keyword),
 	// ── Multi-paradigm aliases ──────────────────────────────────────────────
 	// JS/C++ "throw" is an alias for Python/Nython "raise"
 	TokenDef(TokenType::Raise,std::string("throw"), TokenKind::Name, TokenClass::Keyword),
@@ -1099,11 +1104,36 @@ void Lexer::read_token() {
                     decoded.pop();
                 }
             } else {
+                // `\` immediately before a real line break is a line
+                // continuation: consumed, no token, so the next physical
+                // line lexes as if it continued this one. Anything else
+                // after `\` is the RevDiv ("\", floor division — a second
+                // spelling of `//`, see NythonExecutor.hpp/VirtualMachine.hpp)
+                // operator, or RevDivAssign for `\=`.
+                //
+                // This used to unconditionally treat any `\` not directly
+                // followed by '\n'/'\x0c' as a "Line Continuation Error" and
+                // return before ever reaching the RevDiv/RevDivAssign checks
+                // below — which made those checks dead code no source file
+                // could actually reach: `\` followed by '=' hit the error
+                // path (since '=' is neither '\n' nor '\x0c') just like `\`
+                // followed by anything else, so `10 \ 2` and `x \= 3` both
+                // failed to lex at all instead of being read as operators.
                 if(c == '\r') {
+                    source.read_char();
+                    if(source.peek_char() == '\n') source.read_char();
+                    return;
+                }
+                if(c == '\n' || c == '\x0c') {
                     source.read_char();
                     return;
                 }
-                if(c != '\n' && c != '\x0c') {
+                if(c=='=') {
+                    source.read_char();
+                    this->token.value = "\\=";
+                    make_token(TokenType::RevDivAssign,TokenKind::AntiSlashEqual,TokenClass::Assignment);
+                } else if(c=='\0' && source.isAtEnd()) {
+                    // Bare trailing backslash with nothing after it at all.
                     errors++;
                     Token token = {
                         {TokenType::LineContinuationError, TokenKind::Error, TokenClass::Default},
@@ -1119,10 +1149,6 @@ void Lexer::read_token() {
                     tokens.push_back(token);
                     add_info_item(LexerInfoLevel::Error,token);
                     return;
-                }
-                if(c=='=') {
-                    this->token.value = "\\=";
-                    make_token(TokenType::RevDivAssign,TokenKind::AntiSlashEqual,TokenClass::Assignment);
                 } else {
                     this->token.value = "\\";
                     make_token(TokenType::RevDiv,TokenKind::AntiSlash,TokenClass::Operator);

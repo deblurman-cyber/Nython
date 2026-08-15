@@ -84,6 +84,13 @@ enum class Op : uint8_t {
     LIST_EXTEND, LIST_APPEND, LOAD_SUPER,
     RAISE, STORE_EXCEPT_AS,
     LOAD_SELF_ATTR, STORE_SELF_ATTR,
+    // `===`/`!==` (strict: no int/float coercion, unlike COMPARE_EQ) and
+    // logical `xor`/`^^` (truthiness xor - BINARY_XOR above is the bitwise
+    // `^`, a different operator). These parsed into a BinaryNode fine but
+    // bin_op() had no case for any of the three, so they compiled to NOP -
+    // the operands were left on the stack instead of being combined and
+    // consumed, corrupting whatever ran next (see HANDOFF.md).
+    COMPARE_SEQ, COMPARE_SNE, LOGICAL_XOR,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -394,6 +401,21 @@ class Compiler {
     void emit_dn(const std::string& n,int l=0){ emit(Op::DEFINE_NAME,C().add_name(n),l); }
     int  ln(nython::node::node_ptr nd) { return nd?nd->token().location().row:0; }
 
+    // Integer literal tokens keep their source spelling verbatim
+    // ("0xFF", "0o17", "0b1010"), but plain std::stoll(s) - base 10 by
+    // default - stops at the first non-decimal digit, so it silently
+    // parsed just the leading "0" of every one of these and returned 0,
+    // instead of 255/15/10. Matches the interpreter's evalInteger
+    // (NythonExecutor.hpp), which already does this prefix check.
+    static int64_t parse_int_literal(const std::string& v){
+        if(v.size()>2 && v[0]=='0'){
+            if(v[1]=='x'||v[1]=='X') return std::stoll(v,nullptr,16);
+            if(v[1]=='o'||v[1]=='O') return std::stoll(v.substr(2),nullptr,8);
+            if(v[1]=='b'||v[1]=='B') return std::stoll(v.substr(2),nullptr,2);
+        }
+        return std::stoll(v);
+    }
+
     static constexpr int BREAK_PH=-9991, CONT_PH=-9992;
     // is_for: the loop keeps an iterator on the value stack between iterations
     // (pushed by GET_ITER, popped by FOR_ITER on exhaustion). A `break` jumps
@@ -433,7 +455,7 @@ private:
         if(nd->type()==NT::WALRUS) std::cerr<<"[DBG] visit WALRUS node!\n";
         switch(nd->type()) {
         // Literals
-        case NT::INTEGER: emit_lc(VMVal::make_int(std::stoll(nd->token().value)),l); break;
+        case NT::INTEGER: emit_lc(VMVal::make_int(parse_int_literal(nd->token().value)),l); break;
         case NT::FLOAT:   emit_lc(VMVal::make_float(std::stod(nd->token().value)),l); break;
         case NT::STRING:  emit_lc(VMVal::make_str(nd->token().value),l); break;
         case NT::TRUE:    emit_lc(VMVal::make_bool(true),l); break;
@@ -499,6 +521,17 @@ private:
         }
         case NT::ASSIGNMENT_AUG: {
             auto an=std::static_pointer_cast<nython::node::AugAssignNode>(nd);
+            if(an->op=="~="){
+                // No natural binary reading of "complement" exists (see the
+                // identical comment on the interpreter's evalAugAssignment,
+                // NythonExecutor.hpp): `x ~= y` assigns the bitwise
+                // complement of y to x, discarding the old x rather than
+                // combining with it - doesn't fit the load-target/combine
+                // pattern below.
+                visit(an->value_node);
+                emit(Op::UNARY_BITNOT,0,l);
+                store(an->target,l); break;
+            }
             // Load current value of target
             load_target(an->target,l);
             // Load new value and apply op
@@ -521,8 +554,23 @@ private:
         // Unary
         case NT::UNARY: {
             auto u=std::static_pointer_cast<nython::node::UnaryNode>(nd);
-            visit(u->operand);
             std::string op=u->op;
+            if(op=="++"||op=="--"){
+                // Post-increment/decrement: `x++` evaluates to the OLD
+                // value but updates the variable/attribute/subscript to
+                // old+-1, matching the interpreter's evalUnary
+                // (NythonExecutor.hpp). This used to fall through to the
+                // `else` branch below (UNARY_POS, a no-op on the loaded
+                // value) - `x++` compiled to reading x and discarding it:
+                // no increment, no write-back, at all.
+                load_target(u->operand,l);
+                emit(Op::DUP_TOP,0,l);
+                emit_lc(VMVal::make_int(1),l);
+                emit(op=="++"?Op::IADD:Op::ISUB,0,l);
+                store(u->operand,l);
+                break;
+            }
+            visit(u->operand);
             if(op=="-"||op=="neg")      emit(Op::UNARY_NEG,0,l);
             else if(op=="not"||op=="!") emit(Op::UNARY_NOT,0,l);
             else if(op=="~")            emit(Op::UNARY_BITNOT,0,l);
@@ -549,13 +597,20 @@ private:
             // variable — which since round 52 raises NameError rather than
             // yielding none. A distinct opcode carrying the name as a constant
             // keeps `x is int` and `x is "int"` different things.
-            if((op=="is"||op=="is not") && b->right
+            // `instanceof` is a second spelling of `is` (see bin_op() and
+            // the interpreter's evalBinary, NythonExecutor.hpp) and needs
+            // the same type-name special case - without it, `a instanceof
+            // Animal` fell to the generic bin_op() path below, which maps
+            // straight to COMPARE_IS (plain value/pointer equality between
+            // the instance and the class itself, never true) instead of
+            // this opcode's actual type check.
+            if((op=="is"||op=="is not"||op=="instanceof") && b->right
                && b->right->type()==NT::VARIABLE){
                 const std::string& tn=b->right->token().value;
                 if(isTypeNameToken(tn)){
                     visit(b->left);
                     emit_lc(VMVal::make_str(tn),l);
-                    emit(op=="is"?Op::COMPARE_IS_TYPE:Op::COMPARE_IS_NOT_TYPE,0,l);
+                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE,0,l);
                     break;
                 }
             }
@@ -751,6 +806,74 @@ private:
         }
         // Class
         case NT::CLASS: visit_class(std::static_pointer_cast<nython::node::ClassNode>(nd)); break;
+        // Enum - previously fell to `default: NOP`, silently dropping the
+        // whole declaration (the interpreter's evalEnum, NythonExecutor.hpp,
+        // already builds a real map of name->value; this compiles the same
+        // shape via BUILD_MAP, reusing the NT::MAP pattern just above).
+        case NT::ENUM: {
+            auto en=std::static_pointer_cast<nython::node::EnumNode>(nd);
+            int counter=0;
+            for(auto& item:en->items){
+                auto ei=std::static_pointer_cast<nython::node::EnumItemNode>(item);
+                emit_lc(VMVal::make_str(ei->name),l);
+                if(ei->value_node) visit(ei->value_node);
+                else emit_lc(VMVal::make_int(counter),l);
+                counter++;
+            }
+            emit(Op::BUILD_MAP,(int)en->items.size(),l);
+            emit_dn(en->name,l);
+            break;
+        }
+        // Namespace - previously dropped entirely (default: NOP), including
+        // its body, so nothing inside a `namespace ns:` block ever ran on
+        // the VM. Compiles the body normally (its statements define names
+        // the ordinary way) then collects the namespace's own top-level
+        // names into a map bound to its name, mirroring the interpreter's
+        // evalNamespace fix (NythonExecutor.hpp) so `ns.thing` resolves.
+        // Unlike the interpreter's child-Context version, the body's names
+        // are NOT isolated from the enclosing scope here (the VM has no
+        // equivalent lightweight child scope to run a statement list in) -
+        // `thing` ends up reachable both bare and as `ns.thing`. A closer
+        // match would need real block-scoping, which `block:` also lacks
+        // (see HANDOFF.md) and is out of scope for this fix.
+        case NT::NAMESPACE: {
+            auto nn=std::static_pointer_cast<nython::node::NameSpaceNode>(nd);
+            std::vector<std::string> member_names;
+            if(nn->body) for(auto& stmt:nn->body->statements()){
+                std::string mn;
+                if(stmt->type()==NT::VARIABLE_DECL) mn=std::static_pointer_cast<nython::node::VarDeclNode>(stmt)->name;
+                else if(stmt->type()==NT::FUNCTION) mn=std::static_pointer_cast<nython::node::FunctionNode>(stmt)->name;
+                else if(stmt->type()==NT::CLASS) mn=std::static_pointer_cast<nython::node::ClassNode>(stmt)->name;
+                if(!mn.empty()) member_names.push_back(mn);
+            }
+            if(nn->body) for(auto& s:nn->body->statements()) visit(s);
+            for(auto& mn:member_names){ emit_lc(VMVal::make_str(mn),l); emit_ln(mn,l); }
+            emit(Op::BUILD_MAP,(int)member_names.size(),l);
+            emit_dn(nn->name,l);
+            break;
+        }
+        // Interface - bound as a real class (same MAKE_CLASS path as
+        // NT::CLASS just above) so `implements MyInterface` - which
+        // Parser.cpp's classDecl stores as an extra base, the same list a
+        // `class Foo(Bar):` parent occupies - resolves to something real,
+        // matching the interpreter's fix (evalInterfaceDecl,
+        // NythonExecutor.hpp). Previously dropped entirely (default: NOP),
+        // including its body.
+        case NT::INTERFACE: {
+            auto in_=std::static_pointer_cast<nython::node::InterfaceNode>(nd);
+            push_code(in_->name,true);
+            code_->is_class=true;
+            if(in_->body) for(auto& s:in_->body->statements()) visit(s);
+            emit(Op::HALT,0,l);
+            pop_code();
+            int idx=(int)C().sub_codes.size()-1;
+            emit(Op::MAKE_CLASS,idx,l); emit_dn(in_->name,l);
+            break;
+        }
+        // Package - a cosmetic declaration on the interpreter too
+        // (PackageNode::eval is a pure no-op, ASTNodes.hpp); NOP is the
+        // correct, matching behaviour, not a gap.
+        case NT::PACKAGE: break;
         // Call
         case NT::CALL: visit_call(std::static_pointer_cast<nython::node::CallNode>(nd)); break;
 
@@ -1111,7 +1234,7 @@ private:
             if(i<(int)fn->defaults.size()&&fn->defaults[i]){
                 auto& dn=fn->defaults[i];
                 switch(dn->type()){
-                    case NT::INTEGER: dflt=VMVal::make_int(std::stoll(dn->token().value)); break;
+                    case NT::INTEGER: dflt=VMVal::make_int(parse_int_literal(dn->token().value)); break;
                     case NT::FLOAT:   dflt=VMVal::make_float(std::stod(dn->token().value)); break;
                     case NT::STRING:  dflt=VMVal::make_str(dn->token().value); break;
                     case NT::TRUE:    dflt=VMVal::make_bool(true); break;
@@ -1333,6 +1456,13 @@ private:
         if(op=="not in") return Op::COMPARE_NOT_IN;
         if(op=="is") return Op::COMPARE_IS;
         if(op=="is not") return Op::COMPARE_IS_NOT;
+        // `instanceof` is a second spelling of `is` for class-membership
+        // checks (`x instanceof MyClass`), matching the interpreter
+        // (NythonExecutor.hpp), which folds it into the same "is" branch.
+        if(op=="instanceof") return Op::COMPARE_IS;
+        if(op=="==="||op=="equals") return Op::COMPARE_SEQ;
+        if(op=="!==") return Op::COMPARE_SNE;
+        if(op=="xor"||op=="^^") return Op::LOGICAL_XOR;
         return Op::NOP;
     }
     static Op aug_op(const std::string& op) {
@@ -1345,13 +1475,13 @@ private:
         // "combine target and new value" - with no combining opcode emitted,
         // the target was just silently replaced by the right-hand operand
         // (x=24; x//=5 left x==5, the unmodified operand, instead of 4).
-        if(op=="//=") return Op::BINARY_FLOOR_DIV;
+        if(op=="//="||op=="\\=") return Op::BINARY_FLOOR_DIV;
         if(op=="**=") return Op::BINARY_POW;
         if(op=="&=") return Op::BINARY_AND;
         if(op=="|=") return Op::BINARY_OR;
         if(op=="^=") return Op::BINARY_XOR;
         if(op=="<<=") return Op::BINARY_LSHIFT;
-        if(op==">>=") return Op::BINARY_RSHIFT;
+        if(op==">>="||op==">>>=") return Op::BINARY_RSHIFT;
         return Op::NOP;
     }
 };
@@ -1961,6 +2091,23 @@ private:
                 VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__ne__",{r});if(res.type!=VMType::NONE){push(res);break;}}
                 push(VMVal::make_bool(lv!=r)); break;
+            }
+            case Op::COMPARE_SEQ: {
+                // Strict equality: same type AND same value, no int/float
+                // coercion (unlike ==) - matches the interpreter's "===".
+                VMVal r=pop(),lv=pop();
+                push(VMVal::make_bool(lv.type==r.type && lv==r)); break;
+            }
+            case Op::COMPARE_SNE: {
+                VMVal r=pop(),lv=pop();
+                push(VMVal::make_bool(!(lv.type==r.type && lv==r))); break;
+            }
+            case Op::LOGICAL_XOR: {
+                // Truthiness xor - true when exactly one side is truthy,
+                // matching the interpreter's "xor"/"^^" (distinct from the
+                // bitwise `^`, which is BINARY_XOR).
+                VMVal r=pop(),lv=pop();
+                push(VMVal::make_bool(lv.is_truthy()!=r.is_truthy())); break;
             }
             case Op::COMPARE_LT: {
                 VMVal r=pop(),lv=pop();
@@ -2607,9 +2754,12 @@ private:
         double a=to_d(l),b=to_d(r);
         if(b==0.0) throw std::runtime_error("ZeroDivisionError: division by zero");
         if(floor_div) return VMVal::make_int((int64_t)std::floor(a/b));
-        // Return int when both operands are ints and result is exact
-        if(l.type==VMType::INT&&r.type==VMType::INT&&r.i!=0&&l.i%r.i==0)
-            return VMVal::make_int(l.i/r.i);
+        // `/` is true division and always returns a float, matching the
+        // interpreter (NythonExecutor.hpp: "Return float (true division) -
+        // use // for integer division") and Python. This used to return an
+        // int whenever the division was exact (10/2 -> int 5), which is a
+        // real engine divergence documented in HANDOFF.md 5.4 - resolved by
+        // an explicit ruling: 10/2 == 5.0, 10//2 == 10\2 == 5.
         return VMVal::make_float(a/b);
     }
     static VMVal op_mod(const VMVal& l, const VMVal& r) {
@@ -5466,6 +5616,9 @@ private:
         case Op::BINARY_LSHIFT:return "BINARY_LSHIFT";
         case Op::BINARY_RSHIFT:return "BINARY_RSHIFT";
         case Op::COMPARE_EQ:   return "COMPARE_EQ";
+        case Op::COMPARE_SEQ:  return "COMPARE_SEQ";
+        case Op::COMPARE_SNE:  return "COMPARE_SNE";
+        case Op::LOGICAL_XOR:  return "LOGICAL_XOR";
         case Op::COMPARE_NE:   return "COMPARE_NE";
         case Op::COMPARE_LT:   return "COMPARE_LT";
         case Op::COMPARE_LE:   return "COMPARE_LE";
