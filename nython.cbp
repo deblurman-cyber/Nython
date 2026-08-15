@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<CodeBlocks_project_file>
+    <FileVersion major="1" minor="6" />
+    <Project>
+        <Option title="Nython" />
+        <Option pch_mode="2" />
+        <Option compiler="gcc" />
+        <Build>
+            <!-- ═══════════════════════════════════════════════════════════
+                 RELEASE — optimised, no console window, IDE auto-launches
+                 ═══════════════════════════════════════════════════════════ -->
+            <Target title="Release">
+                <Option output="bin/Release/nython" prefix_auto="1" extension_auto="1" />
+                <Option object_output="obj/Release/" />
+                <Option type="0" />
+                <!-- type 0 = GUI app (no extra console window) -->
+                <Option compiler="gcc" />
+                <Compiler>
+                    <Add option="-std=c++20" />
+                    <Add option="-O2" />
+                    <Add option="-Wall" />
+                    <Add option="-Wno-misleading-indentation" />
+                    <Add option="-Wno-unused-but-set-variable" />
+                    <Add option="-Wno-unused-function" />
+                    <Add option="-Wno-cpp" />
+                    <Add option="-Wno-effc++" />
+                    <!-- IDE opens on launch with no arguments -->
+                    <Add option="-DNYTHON_WITH_IDE=1" />
+                    <!-- Tell SDL3 we provide our own main() — prevents linker errors -->
+                    <Add option="-DSDL_MAIN_HANDLED=1" />
+                    <!-- Vista+ required for inet_pton, GetAddrInfoW etc. -->
+                    <Add option="-D_WIN32_WINNT=0x0600" />
+                    <Add option="-Wno-overloaded-virtual" />
+                    <!-- GCC 16 safety: prevent UB→illegal-instruction traps -->
+                    <Add option="-march=x86-64" />
+                    <Add option="-fno-strict-aliasing" />
+                    <Add option="-fwrapv" />
+                    <Add option="-fno-delete-null-pointer-checks" />
+                    <Add directory="include" />
+                    <Add directory="C:\SDL3\include" />
+                </Compiler>
+                <Linker>
+                    <!-- Link order matters on MinGW: mingw32 first, then SDL, then system libs -->
+                    <Add library="mingw32" />
+                    <Add library="SDL3" />
+                    <Add library="SDL3_ttf" />
+                    <Add library="SDL3_image" />
+                    <Add library="ws2_32" />
+                    <Add library="pthread" />
+                    <Add directory="C:\SDL3\lib" />
+                </Linker>
+            </Target>
+            <!-- ═══════════════════════════════════════════════════════════
+                 DEBUG — symbols, console window for stderr diagnostics
+                 ═══════════════════════════════════════════════════════════ -->
+            <Target title="Debug">
+                <ExtraCommands>
+                    <After>cmd /c "if exist C:\SDL3\bin\SDL3.dll copy C:\SDL3\bin\*.dll bin\Debug\ >nul 2>&1"</After>
+                    <After>cmd /c "if not exist bin\Debug\nython_ide.ny copy nython_ide.ny bin\Debug\ >nul 2>&1"</After>
+                    <After>cmd /c "if not exist bin\Debug\lib xcopy /e /q /y lib bin\Debug\lib\ >nul 2>&1"</After>
+                </ExtraCommands>
+                <Option output="bin/Debug/nython" prefix_auto="1" extension_auto="1" />
+                <Option object_output="obj/Debug/" />
+                <Option type="1" />
+                <!-- type 1 = console app (shows stderr messages in terminal) -->
+                <Option compiler="gcc" />
+                <Compiler>
+                    <Add option="-std=c++20" />
+                    <Add option="-g" />
+                    <Add option="-O0" />
+                    <Add option="-Wall" />
+                    <Add option="-Wno-misleading-indentation" />
+                    <Add option="-Wno-unused-but-set-variable" />
+                    <Add option="-Wno-unused-function" />
+                    <Add option="-Wno-cpp" />
+                    <Add option="-DNYTHON_WITH_IDE=1" />
+                    <Add option="-DSDL_MAIN_HANDLED=1" />
+                    <!-- Vista+ required for inet_pton, GetAddrInfoW etc. -->
+                    <Add option="-D_WIN32_WINNT=0x0600" />
+                    <Add option="-Wno-overloaded-virtual" />
+                    <!-- GCC 16 safety: prevent UB→illegal-instruction traps -->
+                    <Add option="-march=x86-64" />
+                    <Add option="-fno-strict-aliasing" />
+                    <Add option="-fwrapv" />
+                    <Add option="-fno-delete-null-pointer-checks" />
+                    <Add directory="include" />
+                    <Add directory="C:\SDL3\include" />
+                </Compiler>
+                <Linker>
+                    <Add library="mingw32" />
+                    <Add library="SDL3" />
+                    <Add library="SDL3_ttf" />
+                    <Add library="SDL3_image" />
+                    <Add library="ws2_32" />
+                    <Add library="pthread" />
+                    <Add directory="C:\SDL3\lib" />
+                </Linker>
+            </Target>
+        </Build>
+        <!-- Global compiler settings (applied to all targets) -->
+        <Compiler>
+            <Add option="-std=c++20" />
+            <Add option="-Wall" />
+            <Add option="-Wno-misleading-indentation" />
+            <Add option="-Wno-unused-but-set-variable" />
+            <Add option="-Wno-unused-function" />
+            <Add option="-Wno-cpp" />
+            <Add directory="include" />
+        </Compiler>
+        <Linker>
+            <Add library="ws2_32" />
+        </Linker>
+        <!-- ═══════════ Source files ═══════════ -->
+        <Unit filename="src/main.cpp" />
+        <Unit filename="src/Class.cpp" />
+        <Unit filename="src/CliFlages.cpp" />
+        <Unit filename="src/Collectable.cpp" />
+        <Unit filename="src/ConsoleManager.cpp" />
+        <Unit filename="src/Container.cpp" />
+        <Unit filename="src/Context.cpp" />
+        <Unit filename="src/DynamicLang.cpp" />
+        <Unit filename="src/GarbageCollector.cpp" />
+        <Unit filename="src/Interpreter.cpp" />
+        <Unit filename="src/Lexer.cpp" />
+        <Unit filename="src/List.cpp" />
+        <Unit filename="src/Logger.cpp" />
+        <Unit filename="src/Node.cpp" />
+        <Unit filename="src/Object.cpp" />
+        <Unit filename="src/Parser.cpp" />
+        <Unit filename="src/Regex.cpp" />
+        <Unit filename="src/SourceCode.cpp" />
+        <Unit filename="src/Thread.cpp" />
+        <Unit filename="src/Token.cpp" />
+        <Unit filename="src/Type.cpp" />
+        <Unit filename="src/Utf8Buffer.cpp" />
+        <Unit filename="src/Util.cpp" />
+        <Unit filename="src/Value.cpp" />
+        <Unit filename="src/VirtualMachine.cpp" />
+        <!-- ═══════════ Builtin modules ═══════════ -->
+        <Unit filename="src/builtins/audio.cpp" />
+        <Unit filename="src/builtins/core.cpp" />
+        <Unit filename="src/builtins/data.cpp" />
+        <Unit filename="src/builtins/gui.cpp" />
+        <Unit filename="src/builtins/io.cpp" />
+        <Unit filename="src/builtins/lang.cpp" />
+        <Unit filename="src/builtins/math.cpp" />
+        <Unit filename="src/builtins/network.cpp" />
+        <Unit filename="src/builtins/os.cpp" />
+        <Unit filename="src/builtins/string.cpp" />
+        <Unit filename="src/builtins/tensor.cpp" />
+        <Unit filename="src/builtins/threading.cpp" />
+        <!-- ═══════════ Key headers (for IDE navigation) ═══════════ -->
+        <Unit filename="include/platform_compat.hpp" />
+        <Unit filename="include/NythonExecutor.hpp" />
+        <Unit filename="include/VirtualMachine.hpp" />
+        <Unit filename="include/Definitions.hpp" />
+        <Unit filename="include/Value.hpp" />
+        <Unit filename="include/ASTNodes.hpp" />
+        <Unit filename="include/Nython.hpp" />
+        <Unit filename="include/Interpreter.hpp" />
+        <Unit filename="include/NythonREPL.hpp" />
+        <Unit filename="include/builtins/core.hpp" />
+        <Unit filename="include/builtins/tensor.hpp" />
+        <Unit filename="include/builtins/audio.hpp" />
+        <Unit filename="include/builtins/string.hpp" />
+        <Unit filename="include/builtins/io.hpp" />
+        <Unit filename="include/builtins/lang.hpp" />
+        <Unit filename="include/builtins/network.hpp" />
+        <Unit filename="include/builtins/math.hpp" />
+        <Unit filename="include/builtins/os.hpp" />
+        <Unit filename="include/builtins/data.hpp" />
+        <Unit filename="include/builtins/threading.hpp" />
+        <Unit filename="include/builtins/gui.hpp" />
+    </Project>
+</CodeBlocks_project_file>

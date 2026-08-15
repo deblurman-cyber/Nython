@@ -1,0 +1,574 @@
+# Scripted UI walkthrough for NythonIDE v4.
+# Replayed by tests/ide/run_ui_tests.sh against a harness that can inject events.
+wait 3
+shot base
+down 27 138
+up 27 138
+wait 2
+shot rail_search
+down 27 180
+up 27 180
+wait 2
+shot rail_git
+down 27 96
+up 27 96
+wait 2
+shot rail_explorer
+down 460 88
+up 460 88
+wait 2
+shot tab_utils
+down 575 88
+up 575 88
+wait 2
+shot tab_model
+down 340 88
+up 340 88
+wait 2
+shot tab_main
+down 400 487
+up 400 487
+wait 2
+shot panel_problems
+down 500 487
+up 500 487
+wait 2
+shot panel_terminal
+text version
+wait 1
+key enter
+wait 2
+shot term_version
+down 340 487
+up 340 487
+wait 2
+shot panel_output
+key p ctrl
+wait 2
+shot palette_open
+text tog
+wait 2
+shot palette_filtered
+key escape
+wait 2
+shot palette_closed
+key f5
+wait 2
+shot after_f5
+down 128 15
+up 128 15
+wait 2
+shot menu_view
+down 200 60
+up 200 60
+wait 2
+shot menu_toggle_sidebar
+down 128 15
+up 128 15
+wait 1
+down 200 60
+up 200 60
+wait 2
+shot sidebar_restored
+down 527 88
+up 527 88
+wait 2
+shot tab_closed
+resize 1024 600
+wait 2
+shot resized_small
+resize 1500 900
+wait 2
+shot resized_large
+# ── project workflow ───────────────────────────────────────────────
+down 60 15
+up 60 15
+wait 2
+shot file_menu
+down 120 74
+up 120 74
+wait 3
+shot dialog_new_project
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+text /tmp/NyIdeTestProj
+wait 2
+shot dialog_typed
+key enter
+wait 4
+shot project_created
+# Restore the startup geometry: the resize checks above left the window at
+# 1500x900, which moves every panel coordinate below.
+resize 1326 678
+wait 3
+# ── find / replace / breakpoints ───────────────────────────────────
+key f ctrl
+wait 2
+shot find_open
+text self
+wait 3
+shot find_matches
+key enter
+wait 2
+shot find_next
+key escape
+wait 2
+key h ctrl
+wait 2
+text count
+wait 3
+key tab
+wait 1
+text TOTAL
+wait 2
+shot replace_ready
+key enter ctrl
+wait 3
+shot replaced
+key escape
+wait 2
+down 320 130
+up 320 130
+wait 2
+shot breakpoint_set
+down 570 487
+up 570 487
+wait 2
+shot debug_panel
+# ── editor caret, typing, undo, clipboard ─────────────────────────
+down 500 130
+up 500 130
+wait 2
+shot caret_placed
+text HELLO
+wait 3
+shot typed
+key z ctrl
+wait 3
+shot undone
+key c ctrl
+wait 1
+key v ctrl
+wait 3
+shot pasted
+# ── context menus and autocomplete ────────────────────────────────
+rdown 700 200
+up 700 200
+wait 3
+shot ctx_editor
+down 750 330
+up 750 330
+wait 3
+shot ctx_used
+rdown 150 160
+up 150 160
+wait 3
+shot ctx_tree
+key escape
+wait 2
+rdown 400 88
+up 400 88
+wait 3
+shot ctx_tab
+key escape
+wait 2
+down 500 148
+up 500 148
+wait 2
+key end
+wait 1
+key enter
+wait 1
+text cl
+wait 2
+key space ctrl
+wait 3
+shot autocomplete
+key enter
+wait 3
+shot ac_accepted
+# ── text selection ────────────────────────────────────────────────
+down 380 148
+up 380 148
+wait 2
+key right shift
+key right shift
+key right shift
+key right shift
+key right shift
+wait 3
+shot sel_shift
+key c ctrl
+wait 2
+shot sel_copied
+down 380 148
+move 600 148
+move 600 148
+up 600 148
+wait 3
+shot sel_drag
+key x ctrl
+wait 3
+shot sel_cut
+key z ctrl
+wait 3
+shot sel_undo
+# ── symbol outline and theme ──────────────────────────────────────
+shot theme_dark
+down 27 306
+up 27 306
+wait 3
+shot outline
+down 150 136
+up 150 136
+wait 3
+shot outline_jump
+key t ctrl shift
+wait 3
+shot theme_light
+shot hl_light
+key t ctrl shift
+wait 3
+shot theme_dark_again
+# ── custom highlight tokens, zoom, minimap ────────────────────────
+shot hl_custom_before
+key + ctrl
+key + ctrl
+key + ctrl
+wait 3
+shot zoom_in
+key 0 ctrl
+wait 3
+shot zoom_reset
+# ── tree scrolling, clickable problems, recent files ──────────────
+# Self-contained setup: earlier steps left the workspace on the test project
+# and dragged the panel splitter, both of which move everything below.
+# Reopen the source folder and put the splitter back at its default.
+down 700 380
+move 700 478
+move 700 478
+up 700 478
+wait 2
+key k ctrl
+wait 3
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+text /home/claude/work/nython_src
+wait 2
+key enter
+wait 4
+down 27 96
+up 27 96
+wait 2
+down 150 130
+up 150 130
+wait 4
+shot tree_expanded
+wheel 150 300 -6
+wait 3
+shot tree_scrolled
+wheel 150 300 20
+wait 3
+shot tree_back
+# Populate Problems deterministically: Find in Files lists every match for the
+# current search term, independent of whether the last build happened to fail.
+down 177 15
+up 177 15
+wait 1
+down 220 126
+up 220 126
+wait 4
+down 500 528
+up 500 528
+wait 3
+shot problem_click
+down 60 15
+up 60 15
+wait 1
+down 120 257
+up 120 257
+wait 3
+shot recent_files
+# ── line operations, auto-indent, bracket completion ──────────────
+# Start from a fresh buffer so the assertions do not depend on whatever file
+# earlier steps happened to leave open.
+down 60 15
+up 60 15
+wait 1
+down 120 48
+up 120 48
+wait 3
+down 500 131
+up 500 131
+wait 2
+key end
+wait 1
+key enter
+wait 1
+text class A:
+wait 2
+key enter
+wait 2
+text pass
+wait 3
+shot lo_indent
+key / ctrl
+wait 3
+shot lo_commented
+key / ctrl
+wait 3
+shot lo_uncommented
+key d ctrl
+wait 3
+shot lo_duplicated
+text (
+wait 3
+shot lo_bracket
+# ── AI assistant, VM mode, introspection ──────────────────────────
+# Open a file with known content: the AI analyser reports on the active buffer,
+# and the previous block left a fresh untitled file open.
+key o ctrl
+wait 3
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+key backspace
+text /home/claude/work/nython_src/main.ny
+wait 2
+key enter
+wait 4
+down 27 348
+up 27 348
+wait 4
+shot ai_view
+down 150 160
+up 150 160
+wait 3
+shot ai_jump
+down 27 96
+up 27 96
+wait 2
+down 170 44
+up 170 44
+wait 2
+key f5
+wait 10
+shot vm_run
+down 260 44
+up 260 44
+wait 2
+key f5
+wait 12
+shot tokenize
+# ── workspace search and settings persistence ─────────────────────
+down 27 138
+up 27 138
+wait 3
+shot search_empty
+text tensor
+wait 6
+shot search_results
+down 150 220
+up 150 220
+wait 4
+shot search_open
+down 347 15
+up 347 15
+wait 1
+down 400 135
+up 400 135
+wait 4
+shot settings_saved
+quit
