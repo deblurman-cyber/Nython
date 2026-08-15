@@ -372,8 +372,6 @@ class NythonIDE:
         self.caret_on = true
         self.caret_t = 0
         self.clipboard = ""
-        self.undo_stack = []
-        self.undo_n = 0
         self.debug_line = -1
         self.status_segs = []
         self.status_hover = -1
@@ -1415,13 +1413,13 @@ class NythonIDE:
                     else:
                         self._sel_clear()
                 if e.type == "textinput" or e.key == "backspace" or e.key == "enter":
-                    # Typing over a selection replaces it.
+                    # Typing over a selection replaces it. A plain edit needs
+                    # no push here: EditorBuffer.insert_char/delete_char_back/
+                    # insert_newline record their own undo entry.
                     if self._sel_range() != none:
                         self._sel_delete()
                         if e.key == "backspace":
                             e.consume()
-                    else:
-                        self._push_undo()
                 if e.consumed:
                     return
                 self.editor.handle_event(e)
@@ -1814,8 +1812,16 @@ class NythonIDE:
             self.status_msg = "Saved " + os_path_basename(sp)
             e.consume()
             return true
+        if e.key == "z" and e.ctrl and e.shift:
+            self._redo()
+            e.consume()
+            return true
         if e.key == "z" and e.ctrl:
             self._undo()
+            e.consume()
+            return true
+        if e.key == "y" and e.ctrl:
+            self._redo()
             e.consume()
             return true
         if e.key == "c" and e.ctrl:
@@ -2502,7 +2508,7 @@ class NythonIDE:
         self.tabs[self.active_tab].dirty = true
 
     def _toggle_comment(self):
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var sp = self._line_span()
         # If every non-blank line in the range is already commented, uncomment;
@@ -2536,7 +2542,7 @@ class NythonIDE:
         self.status_msg = "Toggled comment"
 
     def _duplicate_line(self):
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var row = buf.cursor_row
         var out = []
@@ -2553,7 +2559,7 @@ class NythonIDE:
         self.status_msg = "Duplicated line"
 
     def _delete_line(self):
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         if buf.line_count <= 1:
             buf.lines = [""]
@@ -2583,7 +2589,7 @@ class NythonIDE:
         var dest = row + delta
         if dest < 0 or dest >= buf.line_count:
             return
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var tmp = buf.lines[row]
         buf.lines[row] = buf.lines[dest]
         buf.lines[dest] = tmp
@@ -2648,7 +2654,7 @@ class NythonIDE:
         var g = self._sel_range()
         if g == none:
             return false
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var head = string_slice(buf.get_line(g["r1"]), 0, g["c1"])
         var tail = string_slice(buf.get_line(g["r2"]), g["c2"], len(buf.get_line(g["r2"])))
@@ -3123,79 +3129,42 @@ class NythonIDE:
         r.draw_text(self.tooltip, x + 10, y + 6, self.f_small, th.text)
 
     # ── edit actions ─────────────────────────────────────────────────────────
-    # History is whole-file snapshots, so its cost scales with file size, not
-    # edit size: 50 steps on a 140 KB file held 7,000,000 characters in the
-    # measurement for this change — 50 copies of text that is almost entirely
-    # identical. Two bounds keep that in check without altering behaviour:
-    # identical consecutive states are not stored at all, and the stack is
-    # trimmed on total characters as well as on step count, so a large file
-    # keeps fewer steps rather than proportionally more memory.
+    # Undo/redo history now lives on each EditorBuffer itself
+    # (ide_editor.ny), one operation-log entry per edit instead of a
+    # whole-document snapshot per keystroke — see that file's _record_op/
+    # _apply_inverse, modelled on lib/gui_piecetable.ny's PieceTable. This
+    # also makes undo per-tab rather than a single history shared across
+    # every open file, which is what every other editor does and avoids the
+    # old behaviour's occasional surprise of Ctrl+Z switching tabs.
     #
-    # (The real fix is a piece table — lib/gui_piecetable.ny stores the text
-    # once and makes a history entry a list of spans, 140,050 characters for the
-    # same 50 steps. Adopting it means re-backing EditorBuffer, which every
-    # editor feature reads, so it belongs in its own change.)
-    def _push_undo(self):
-        var buf = self.buffers[self.active_tab]
-        var txt = buf.get_all_text()
-        if self.undo_n > 0:
-            var last = self.undo_stack[self.undo_n - 1]
-            if last["tab"] == self.active_tab and last["text"] == txt:
-                return 0
-        self.undo_stack = self.undo_stack + [{"tab": self.active_tab, "text": txt,
-                                              "row": buf.cursor_row, "col": buf.cursor_col}]
-        self.undo_n = self.undo_n + 1
-
-        # Character budget: ~4 MB of history regardless of document size.
-        var budget = 4000000
-        var used = 0
-        var j = self.undo_n - 1
-        var keep_from = 0
-        while j >= 0:
-            used = used + len(self.undo_stack[j]["text"])
-            if used > budget and keep_from == 0:
-                keep_from = j + 1
-            j = j - 1
-        if keep_from > 0:
-            var kept = []
-            var m = keep_from
-            while m < self.undo_n:
-                kept.append(self.undo_stack[m])
-                m = m + 1
-            self.undo_stack = kept
-            self.undo_n = len(kept)
-
-        if self.undo_n > 50:
-            var trimmed = []
-            var i = 1
-            while i < self.undo_n:
-                trimmed.append(self.undo_stack[i])
-                i = i + 1
-            self.undo_stack = trimmed
-            self.undo_n = self.undo_n - 1
-
+    # Character-level edits (typing, backspace, newline) call
+    # EditorBuffer.insert_char/delete_char_back/insert_newline directly, via
+    # self.editor.handle_event(), and record their own undo entry — nothing
+    # to do here for those. Coarser edits that reach into buf.lines directly
+    # (cut/paste a line, comment toggle, move a line, indent/dedent a range,
+    # find/replace-all) still need one snapshot per action; call
+    # self.buffers[self.active_tab].push_snapshot() immediately before them.
     def _undo(self):
-        if self.undo_n == 0:
+        var buf = self.buffers[self.active_tab]
+        if not buf.can_undo():
             self.status_msg = "Nothing to undo"
             return
-        var snap = self.undo_stack[self.undo_n - 1]
-        var keep = []
-        var i = 0
-        while i < self.undo_n - 1:
-            keep.append(self.undo_stack[i])
-            i = i + 1
-        self.undo_stack = keep
-        self.undo_n = self.undo_n - 1
-        var idx = snap["tab"]
-        if idx < self.tab_count:
-            self.buffers[idx] = EditorBuffer(self.tabs[idx].title, snap["text"])
-            self.buffers[idx].cursor_row = snap["row"]
-            self.buffers[idx].cursor_col = snap["col"]
-            self.active_tab = idx
-            self.editor.set_buffer(self.buffers[idx])
+        buf.undo()
+        self.editor.set_buffer(buf)
         self._hl_cache = {}
         self._hl_cache_n = 0
         self.status_msg = "Undo"
+
+    def _redo(self):
+        var buf = self.buffers[self.active_tab]
+        if not buf.can_redo():
+            self.status_msg = "Nothing to redo"
+            return
+        buf.redo()
+        self.editor.set_buffer(buf)
+        self._hl_cache = {}
+        self._hl_cache_n = 0
+        self.status_msg = "Redo"
 
     def _copy_line(self):
         var sel = self._sel_text()
@@ -3214,7 +3183,7 @@ class NythonIDE:
             self._sel_delete()
             self.status_msg = "Cut selection"
             return
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         self.clipboard = buf.get_line(buf.cursor_row)
         var keep = []
@@ -3238,7 +3207,7 @@ class NythonIDE:
         if self.clipboard == "":
             self.status_msg = "Clipboard is empty"
             return
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var out = []
         var i = 0
@@ -3497,6 +3466,10 @@ class NythonIDE:
         if self.find_query == "":
             return
         var buf = self.buffers[self.active_tab]
+        # Not previously undoable at all; now that undo is a per-buffer op
+        # log rather than a hand-placed snapshot call, giving replace-all one
+        # is a one-line addition instead of its own risky change.
+        buf.push_snapshot()
         var replaced = 0
         var i = 0
         while i < buf.line_count:
@@ -3840,7 +3813,7 @@ class NythonIDE:
         elif label == "Undo":
             self._undo()
         elif label == "Redo":
-            self.status_msg = "Nothing to redo"
+            self._redo()
         elif label == "Cut":
             self._cut_line()
         elif label == "Copy":

@@ -17,6 +17,16 @@ class EditorBuffer:
         self.cursor_col = 0
         self.modified = false
         self.language = "nython"
+        # Operation-based undo/redo (see lib/gui_piecetable.ny's design note):
+        # a typed character records four scalars, not a copy of the document.
+        # Only the coarse, infrequent edits below (push_snapshot) cost
+        # anything proportional to document size, and only once per call
+        # rather than once per keystroke.
+        self.undo_ops = []
+        self.undo_n = 0
+        self.redo_ops = []
+        self.redo_n = 0
+        self.max_undo_ops = 1000
         self._parse_content(content)
 
     def _parse_content(self, text):
@@ -62,9 +72,8 @@ class EditorBuffer:
     def insert_char(self, ch):
         var row = self.cursor_row
         var col = self.cursor_col
-        var line = self.get_line(row)
-        var new_line = line[0:col] + ch + line[col:]
-        self.lines[row] = new_line
+        self._raw_insert(row, col, ch)
+        self._record_op({"op": "insert", "row": row, "col": col, "text": ch, "pad": 0})
         # Advance by the length of what was inserted, not by one. A text-input
         # event can carry several characters (paste, IME, a fast key sequence),
         # and advancing by one left the caret inside the text just typed, so the
@@ -77,23 +86,18 @@ class EditorBuffer:
         var col = self.cursor_col
         if col > 0:
             var line = self.get_line(row)
-            self.lines[row] = line[0:col - 1] + line[col:]
+            var removed = line[col - 1:col]
+            self._raw_delete(row, col - 1, 1)
+            self._record_op({"op": "delete", "row": row, "col": col - 1, "text": removed, "pad": 0})
             self.cursor_col = col - 1
             self.modified = true
         elif row > 0:
             var prev = self.get_line(row - 1)
-            var cur = self.get_line(row)
-            self.lines[row - 1] = prev + cur
-            var new_lines = []
-            var i = 0
-            while i < self.line_count:
-                if i != row:
-                    new_lines.append(self.lines[i])
-                i = i + 1
-            self.lines = new_lines
-            self.line_count = self.line_count - 1
+            var split_col = len(prev)
+            self._raw_join(row - 1, 0)
+            self._record_op({"op": "join", "row": row - 1, "col": split_col, "text": "", "pad": 0})
             self.cursor_row = row - 1
-            self.cursor_col = len(prev)
+            self.cursor_col = split_col
             self.modified = true
 
     def insert_newline(self):
@@ -101,7 +105,6 @@ class EditorBuffer:
         var col = self.cursor_col
         var line = self.get_line(row)
         var before = line[0:col]
-        var after = line[col:]
         var indent = 0
         var li = 0
         while li < len(before):
@@ -113,9 +116,34 @@ class EditorBuffer:
         var ends_colon = len(string_strip(before)) > 0 and before[len(before) - 1:] == ":"
         if ends_colon:
             indent = indent + 4
+        self._raw_split(row, col, indent)
+        self._record_op({"op": "newline", "row": row, "col": col, "text": "", "pad": indent})
+        self.cursor_row = row + 1
+        self.cursor_col = indent
+        self.modified = true
+
+    # ── raw mutation primitives ─────────────────────────────────────────────
+    # Single-purpose, unrecorded edits to self.lines. Every user-facing edit
+    # method above is built from these; undo/redo replay the same primitives
+    # in reverse rather than reconstructing the document from a text copy.
+    def _raw_insert(self, row, col, text):
+        var line = self.lines[row]
+        self.lines[row] = line[0:col] + text + line[col:]
+
+    def _raw_delete(self, row, col, count):
+        var line = self.lines[row]
+        self.lines[row] = line[0:col] + line[col + count:]
+
+    # Splits lines[row] at col into two lines, indenting the new second line
+    # by pad_len spaces. The forward half of insert_newline, and the inverse
+    # of _raw_join.
+    def _raw_split(self, row, col, pad_len):
+        var line = self.lines[row]
+        var before = line[0:col]
+        var after = line[col:]
         var pad = ""
         var pi = 0
-        while pi < indent:
+        while pi < pad_len:
             pad = pad + " "
             pi = pi + 1
         self.lines[row] = before
@@ -128,9 +156,146 @@ class EditorBuffer:
             i = i + 1
         self.lines = new_lines
         self.line_count = self.line_count + 1
-        self.cursor_row = row + 1
-        self.cursor_col = indent
+
+    # Merges lines[row+1] into lines[row], dropping pad_len leading characters
+    # from lines[row+1] first. The forward half of delete_char_back's line
+    # merge (pad_len 0, nothing stripped), and the inverse of _raw_split.
+    def _raw_join(self, row, pad_len):
+        var prev = self.lines[row]
+        var cur = self.lines[row + 1]
+        self.lines[row] = prev + cur[pad_len:]
+        var new_lines = []
+        var i = 0
+        while i < self.line_count:
+            if i != row + 1:
+                new_lines.append(self.lines[i])
+            i = i + 1
+        self.lines = new_lines
+        self.line_count = self.line_count - 1
+
+    # ── operation-based undo/redo ───────────────────────────────────────────
+    def _record_op(self, e):
+        self.undo_ops.append(e)
+        self.undo_n = self.undo_n + 1
+        self.redo_ops = []
+        self.redo_n = 0
+        if self.undo_n > self.max_undo_ops:
+            var kept = []
+            var i = 1
+            while i < self.undo_n:
+                kept.append(self.undo_ops[i])
+                i = i + 1
+            self.undo_ops = kept
+            self.undo_n = self.undo_n - 1
+        # Only "snapshot" entries (push_snapshot, for the coarse multi-line
+        # edits below) cost anything proportional to document size; bound
+        # their total the same way the old whole-IDE undo stack did.
+        var budget = 4000000
+        var used = 0
+        var j = self.undo_n - 1
+        var keep_from = 0
+        while j >= 0:
+            if self.undo_ops[j]["op"] == "snapshot":
+                used = used + len(self.undo_ops[j]["text"])
+            if used > budget and keep_from == 0:
+                keep_from = j + 1
+            j = j - 1
+        if keep_from > 0:
+            var kept2 = []
+            var m = keep_from
+            while m < self.undo_n:
+                kept2.append(self.undo_ops[m])
+                m = m + 1
+            self.undo_ops = kept2
+            self.undo_n = len(kept2)
+
+    # For edits too coarse to express as insert/delete/newline/join (cut
+    # line, paste, comment toggle, move line, indent/dedent a range,
+    # find/replace-all) - one full-text copy per discrete user action, not
+    # per keystroke, which is what made the old whole-IDE snapshot stack
+    # expensive.
+    def push_snapshot(self):
+        self._record_op({"op": "snapshot", "row": self.cursor_row, "col": self.cursor_col,
+                          "text": self.get_all_text(), "pad": 0})
+
+    def _restore_text(self, text):
+        self._parse_content(text)
+
+    # Applies the inverse of entry e and returns the entry that would undo
+    # THIS change, for the opposite stack - same shape as
+    # lib/gui_piecetable.ny's PieceTable._apply_inverse.
+    def _apply_inverse(self, e):
+        var op = e["op"]
+        if op == "insert":
+            self._raw_delete(e["row"], e["col"], len(e["text"]))
+            self.cursor_row = e["row"]
+            self.cursor_col = e["col"]
+            return {"op": "delete", "row": e["row"], "col": e["col"], "text": e["text"], "pad": 0}
+        if op == "delete":
+            self._raw_insert(e["row"], e["col"], e["text"])
+            self.cursor_row = e["row"]
+            self.cursor_col = e["col"] + len(e["text"])
+            return {"op": "insert", "row": e["row"], "col": e["col"], "text": e["text"], "pad": 0}
+        if op == "newline":
+            self._raw_join(e["row"], e["pad"])
+            self.cursor_row = e["row"]
+            self.cursor_col = e["col"]
+            return {"op": "join", "row": e["row"], "col": e["col"], "text": "", "pad": e["pad"]}
+        if op == "join":
+            self._raw_split(e["row"], e["col"], e["pad"])
+            self.cursor_row = e["row"] + 1
+            self.cursor_col = e["pad"]
+            return {"op": "newline", "row": e["row"], "col": e["col"], "text": "", "pad": e["pad"]}
+        # "snapshot": the buffer's current text IS the "after" state, since
+        # undo/redo only ever pop the most recent entry - capture it for the
+        # opposite stack before overwriting.
+        var current_text = self.get_all_text()
+        var current_row = self.cursor_row
+        var current_col = self.cursor_col
+        self._restore_text(e["text"])
+        self.cursor_row = e["row"]
+        self.cursor_col = e["col"]
+        return {"op": "snapshot", "row": current_row, "col": current_col, "text": current_text, "pad": 0}
+
+    def can_undo(self):
+        return self.undo_n > 0
+
+    def can_redo(self):
+        return self.redo_n > 0
+
+    def undo(self):
+        if self.undo_n == 0:
+            return false
+        var e = self.undo_ops[self.undo_n - 1]
+        var kept = []
+        var i = 0
+        while i < self.undo_n - 1:
+            kept.append(self.undo_ops[i])
+            i = i + 1
+        self.undo_ops = kept
+        self.undo_n = self.undo_n - 1
+        var inv = self._apply_inverse(e)
+        self.redo_ops.append(inv)
+        self.redo_n = self.redo_n + 1
         self.modified = true
+        return true
+
+    def redo(self):
+        if self.redo_n == 0:
+            return false
+        var e = self.redo_ops[self.redo_n - 1]
+        var kept = []
+        var i = 0
+        while i < self.redo_n - 1:
+            kept.append(self.redo_ops[i])
+            i = i + 1
+        self.redo_ops = kept
+        self.redo_n = self.redo_n - 1
+        var inv = self._apply_inverse(e)
+        self.undo_ops.append(inv)
+        self.undo_n = self.undo_n + 1
+        self.modified = true
+        return true
 
     def move_cursor(self, drow, dcol):
         self.cursor_row = self.cursor_row + drow
