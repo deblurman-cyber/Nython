@@ -225,8 +225,28 @@ struct VMVal {
 struct ExceptionEntry {
     int try_start = 0;
     int try_end   = 0;
-    int handler   = 0;
-    std::string alias;  // variable to bind exception message to
+    // One entry per `except` clause, tried in source order - mirrors the
+    // interpreter's evalTry (NythonExecutor.hpp), which walks tn->except_clauses
+    // and runs the first one whose declared type matches (or is a parent of)
+    // the raised exception's type, or that has no declared type at all. The
+    // VM used to have a single `handler`/`alias` here and always ran the
+    // FIRST except clause's body regardless of its declared type - every
+    // other clause's body wasn't even compiled.
+    struct Clause {
+        std::string type_name;   // empty = catch-all, matches any exception
+        std::string bind_var;    // empty = don't bind (bare "except:")
+        int handler = 0;         // bytecode offset of this clause's body
+    };
+    std::vector<Clause> clauses;
+    // Bytecode offset of the `else` clause's body (runs only if the try body
+    // did NOT raise), or -1 if there is none. Previously not compiled at all.
+    int else_handler = -1;
+    // Offset immediately after the whole try/except/else, used when an
+    // exception is raised but no clause's type matches - the interpreter
+    // silently falls through to `finally` in that case rather than
+    // re-raising, so the VM matches that instead of leaving the exception
+    // to propagate further up.
+    int end = 0;
 };
 
 struct VMCode {
@@ -871,46 +891,51 @@ private:
             auto tn=std::static_pointer_cast<nython::node::TryNode>(nd);
             ExceptionEntry ee;
             ee.try_start = C().here();
-            // Collect alias from first except clause
-            if(!tn->except_clauses.empty()){
-                auto en=std::static_pointer_cast<nython::node::ExceptNode>(tn->except_clauses[0]);
-                ee.alias=en->alias;
-            }
             // Compile try body
             if(tn->body) visit(tn->body);
             ee.try_end = C().here();
-            // Jump over handler if no exception
+            // Jump over the handlers when no exception was raised.
             int jmp_over = C().here(); emit(Op::JUMP_FORWARD,0,l);
-            // Handler starts here
-            ee.handler = C().here();
-            // Register exception entry
-            C().exc_table.push_back(ee);
-            // Compile each except clause
-            bool first=true;
+            // Compile EVERY except clause as its own handler entry point -
+            // previously only the first clause's body was even compiled, so
+            // `except TypeError:` after `except ValueError:` was dead code
+            // and every exception ran the ValueError handler regardless of
+            // its actual type. Which handler to jump to is decided at
+            // runtime by match_except_handler(), comparing the raised
+            // exception's type against each clause's type_name in order -
+            // mirroring the interpreter's evalTry (NythonExecutor.hpp).
+            std::vector<int> end_jumps;
+            auto compile_clause=[&](const std::string& type_filter, const std::string& bind_var, node_ptr body){
+                ExceptionEntry::Clause cl;
+                cl.type_name=type_filter; cl.bind_var=bind_var;
+                cl.handler=C().here();
+                if(!bind_var.empty()) emit_dn(bind_var,l);
+                else emit(Op::POP_TOP,0,l);
+                if(body) visit(body);
+                end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
+                ee.clauses.push_back(std::move(cl));
+            };
             for(auto& ec:tn->except_clauses){
                 auto en=std::static_pointer_cast<nython::node::ExceptNode>(ec);
-                if(first){
-                    // Determine binding variable:
-                    // 'except e:'          → name="e", alias=""  → bind to name
-                    // 'except Err as e:'   → name="Err", alias="e" → bind to alias
-                    // 'except:'            → name="", alias=""   → discard
-                    std::string bind_var = en->alias.empty() ? en->name : en->alias;
-                    // Only bind if it looks like a variable (lowercase first char)
-                    // and is not an exception class name (uppercase)
-                    bool is_var = !bind_var.empty() && (std::islower(bind_var[0]) || bind_var[0]=='_');
-                    if(is_var){
-                        emit_dn(bind_var,l); // TOS = exception message → store in var
-                    } else {
-                        emit(Op::POP_TOP,0,l);
-                    }
-                    if(en->body) visit(en->body);
-                    first=false;
-                }
+                // 'except e:'          -> name="e", alias=""    -> catch-all, bind "e"
+                // 'except Err as e:'    -> name="Err", alias="e"  -> type "Err", bind "e"
+                // 'except:'            -> name="", alias=""     -> catch-all, no bind
+                bool has_type = !en->alias.empty();
+                compile_clause(has_type?en->name:std::string(), has_type?en->alias:en->name, en->body);
             }
             if(tn->except_clauses.empty()){
-                emit(Op::POP_TOP,0,l); // discard exception message
+                // try/finally with no except at all: give the dispatch a
+                // catch-all landing spot that just discards the exception.
+                compile_clause(std::string(),std::string(),nullptr);
             }
+            // No-exception path (and "no clause matched") lands here.
             C().patch(jmp_over,C().here());
+            ee.else_handler = tn->else_clause ? C().here() : -1;
+            if(tn->else_clause) visit(tn->else_clause);
+            int end_pos=C().here();
+            for(int j:end_jumps) C().patch(j,end_pos);
+            ee.end=end_pos;
+            C().exc_table.push_back(ee);
             if(tn->finally_clause) visit(tn->finally_clause);
             break;
         }
@@ -2401,7 +2426,7 @@ private:
                 for(auto& ee : fr.code->exc_table){
                     if(ip_at_raise >= ee.try_start && ip_at_raise < ee.try_end){
                         push(exc_obj);
-                        fr.ip = ee.handler;
+                        fr.ip = match_except_handler(ee, exc_obj);
                         handled = true;
                         last_exception_obj_=VMVal::make_none();
                         break;
@@ -2445,14 +2470,25 @@ private:
                 for(auto& ee:fr2.code->exc_table){
                     if(ip_at_raise>=ee.try_start && ip_at_raise<=ee.try_end){
                         push(exc_val);
-                        fr2.ip=ee.handler;
+                        fr2.ip=match_except_handler(ee, exc_val);
                         handled=true; break;
                     }
                 }
-                // 2) Fallback: find SETUP_EXCEPT instruction
+                // 2) Fallback: find SETUP_EXCEPT instruction (used by `with`,
+                // see NT::WITH). Must skip any SETUP_EXCEPT whose block
+                // already exited normally (reached its matching END_EXCEPT)
+                // - otherwise an exception raised anywhere after a completed
+                // `with` block, with nothing else to catch it, walked back
+                // into that `with`'s stale handler instead of propagating,
+                // re-ran the code after the `with` block, hit the same raise
+                // again, and looped forever.
                 if(!handled){
+                    int skip=0;
                     for(int i=fr2.ip-1;i>=0;i--){
-                        if(fr2.code->instructions[i].op==Op::SETUP_EXCEPT){
+                        Op op2=fr2.code->instructions[i].op;
+                        if(op2==Op::END_EXCEPT){ skip++; continue; }
+                        if(op2==Op::SETUP_EXCEPT){
+                            if(skip>0){ skip--; continue; }
                             push(exc_val);
                             fr2.ip=fr2.code->instructions[i].arg;
                             handled=true; break;
@@ -2682,6 +2718,30 @@ private:
         if(cont.type==VMType::MAP&&cont.map)
             return cont.map->count(item.to_string())>0;
         return false;
+    }
+    // Which except clause (if any) a raised exception should run: the first
+    // whose declared type is empty (catch-all), one of the generic
+    // Exception/BaseException/Error names, equal to the exception's own
+    // type, or a parent of it. Mirrors the interpreter's evalTry
+    // (NythonExecutor.hpp) type-matching, including its silent fall-through
+    // to `finally` (ee.end) when nothing matches rather than re-raising.
+    int match_except_handler(const ExceptionEntry& ee, const VMVal& exc_val) {
+        std::string exc_type = exc_val.type==VMType::INSTANCE ? exc_val.class_name : std::string();
+        for(auto& cl : ee.clauses){
+            if(cl.type_name.empty()) return cl.handler;
+            if(exc_type.empty()) continue; // typed clause, untyped exception: no match
+            if(exc_type==cl.type_name || cl.type_name=="Exception"
+               || cl.type_name=="BaseException" || cl.type_name=="Error")
+                return cl.handler;
+            std::string cur=exc_type; int guard=0;
+            while(!cur.empty() && guard++<16){
+                auto cit=class_reg_.find(cur);
+                if(cit==class_reg_.end()) break;
+                cur=cit->second->parent_class;
+                if(cur==cl.type_name) return cl.handler;
+            }
+        }
+        return ee.end;
     }
     bool value_is_type(const VMVal& v, const std::string& want) {
         // Everything is an Object.
@@ -4721,7 +4781,33 @@ private:
             if(v.type==VMType::INT)return v;
             if(v.type==VMType::FLOAT)return VMVal::make_int((int64_t)v.d);
             if(v.type==VMType::BOOL)return VMVal::make_int(v.b?1:0);
-            if(v.type==VMType::STRING){try{return VMVal::make_int(std::stoll(v.s));}catch(...){}}
+            if(v.type==VMType::STRING){
+                // A parse failure was swallowed and silently returned 0, unlike
+                // the interpreter's int() (src/builtins/tensor.cpp), which
+                // raises ValueError - int("abc") looked like a successful
+                // parse of 0 instead of an error a try/except could catch.
+                // The base argument and 0x/0b/0o prefix auto-detection were
+                // also missing here (always base 10), matched to the
+                // interpreter below.
+                std::string s=v.s;
+                int base=10;
+                if(a.size()>=2&&a[1].type==VMType::INT) base=(int)a[1].i;
+                if(s.size()>2&&s[0]=='0'){
+                    if((s[1]=='x'||s[1]=='X')&&base==10) base=16;
+                    if((s[1]=='b'||s[1]=='B')&&base==10) base=2;
+                    if((s[1]=='o'||s[1]=='O')&&base==10) base=8;
+                    if(base!=10&&(s[1]=='x'||s[1]=='X'||s[1]=='b'||s[1]=='B'||s[1]=='o'||s[1]=='O'))
+                        s=s.substr(2);
+                }
+                try{
+                    size_t idx=0;
+                    long long iv=std::stoll(s,&idx,base);
+                    if(idx!=s.size()) throw std::invalid_argument("not fully consumed");
+                    return VMVal::make_int(iv);
+                }catch(...){
+                    throw std::runtime_error("ValueError: invalid literal for int(): '"+v.s+"'");
+                }
+            }
             return VMVal::make_int(0);});
         globals_["float"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_float(0.0):VMVal::make_float(to_d(a[0]));});
