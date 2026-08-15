@@ -190,6 +190,7 @@ DECLARE_ENUM_WITH_TYPE (
 	LeftArrow,/// '<-'
 	Regex,
 	New,
+	Struct,
 	TokenTypeCount
 );
 

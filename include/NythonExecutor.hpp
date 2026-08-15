@@ -552,7 +552,7 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::REPEAT: return evalRepeat(node, ctx);
             case NodeType::WITH: return evalWith(node, ctx);
             case NodeType::NAMESPACE: return evalNamespace(node, ctx);
-            case NodeType::INTERFACE: return NONE_VALUE;
+            case NodeType::INTERFACE: return evalInterfaceDecl(node, ctx);
             case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yield_sink_->push_back(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
             case NodeType::GLOBAL: return NONE_VALUE;
             case NodeType::SELF: return ctx->getByName("self");
@@ -847,7 +847,7 @@ public:   // NythonExecutor is a struct: members default to public
                 result = Value(std::pow(a, b));
             }
         }
-        else if (an->op == "//=") {
+        else if (an->op == "//=" || an->op == "\\=") {
             double da = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
             double db = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
             if (db == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
@@ -873,10 +873,29 @@ public:   // NythonExecutor is a struct: members default to public
             int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
             result = Value(static_cast<int>(a << b));
         }
-        else if (an->op == ">>=") {
+        else if (an->op == ">>=" || an->op == ">>>=") {
+            // `>>>=` (ShiftAssign, unsigned/logical right shift) parsed
+            // fine (Parser::isAugAssign) but had no case here, so it
+            // silently fell to `else result = new_val;` below - the shift
+            // was discarded and the target just became the shift amount.
+            // Integers here are arbitrary-precision (bigint), which has no
+            // fixed bit width to zero-fill from, so there is no daylight
+            // between "arithmetic" and "logical" right shift to preserve;
+            // treated as the same operation as `>>=`.
             int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
             int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
             result = Value(static_cast<int>(a >> b));
+        }
+        else if (an->op == "~=") {
+            // No natural binary reading of "complement" exists, so this is
+            // a judgment call, documented here rather than left a silent
+            // no-op: `x ~= y` assigns the bitwise complement of the RIGHT
+            // operand to x (`x = ~y`), the same relationship `x = ~x` has
+            // to bare `~x` (complement-then-assign), extended to two
+            // operands the way every other compound assignment reads
+            // `x op= y` as `x = x op y`. Old x is discarded, not combined.
+            int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
+            result = Value(static_cast<int>(~b));
         }
         else result = new_val;
         if (an->target->type() == NodeType::VARIABLE) {
@@ -1219,8 +1238,13 @@ return lv * rv;
             if (rv.type == ValueType::DOUBLE && rv.value.d == 0.0) throw std::string("__exc__:ZeroDivisionError:division by zero");
             return lv / rv;
         }
-        if (bn->op == "//") {
-            // Floor division
+        if (bn->op == "//" || bn->op == "\\") {
+            // Floor division. `\` (RevDiv, see IToken.hpp) is a second
+            // spelling for the same operator — lexed and parsed since round
+            // 1 (Parser.cpp's multiplication()) but never actually
+            // evaluated on this engine, so `10 \ 2` silently read `none`.
+            // The VM already treats them as synonyms (VirtualMachine.hpp's
+            // bin_op()); this brings the interpreter to parity.
             if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
                 int64_t a = bigint_to_i64(lv.value.i);
                 int64_t b = bigint_to_i64(rv.value.i);
@@ -1437,7 +1461,11 @@ return lv * rv;
             else { return Value(false); }
             return Value(a_d >= b_d);
         }
-        if (bn->op == "is") {
+        if (bn->op == "is" || bn->op == "instanceof") {
+            // `instanceof` is a second spelling of `is` for class-membership
+            // checks (`x instanceof MyClass`) - it parsed into a BinaryNode
+            // (Parser.cpp) but had no evaluation case at all here, so it
+            // always fell through to the final `return NONE_VALUE;`.
             // `is` answers "does the left operand belong to the right?" in the
             // widest useful sense, not only pointer identity:
             //
@@ -3394,6 +3422,33 @@ return lv * rv;
         return class_val;
     }
 
+    // Bind the interface as a real class-like value, registered the same
+    // way evalClassDecl registers a class, so `implements MyInterface`
+    // (Parser.cpp's classDecl stores implemented interface names as extra
+    // bases, same list a `class Foo(Bar):` parent occupies) resolves to
+    // something real, and the existing is_a/isinstance inheritance-chain
+    // walk - which looks classes up by name in class_by_name - finds it.
+    // This used to be an unconditional `return NONE_VALUE;` in evalNode's
+    // main switch that bypassed InterfaceNode's own (dead) eval() entirely,
+    // so an interface's name was never defined at all and `implements
+    // Shape` silently referenced nothing.
+    Value evalInterfaceDecl(node_ptr node, Context* ctx) {
+        auto in_ = static_pointer_cast<InterfaceNode>(node);
+        Value class_val;
+        class_val.type = ValueType::USERDATA;
+        class_val.value.p = (void*)node.get();
+        func_names[(void*)node.get()] = "__class__:" + in_->name;
+        class_by_name[in_->name] = (void*)node.get();
+        ctx->defineByName(in_->name, class_val);
+        if (in_->body) {
+            Context* iface_ctx = new Context(runner, in_->name, nullptr, nullptr, ctx);
+            evalNode(in_->body, iface_ctx);
+            class_ctx_map_[(void*)node.get()] = iface_ctx;
+            markEscaped(iface_ctx);
+        }
+        return class_val;
+    }
+
     Value evalLambda(node_ptr node, Context* ctx) {
         int64_t fid = ++closure_id_counter;
         auto unique_key = std::make_unique<int64_t>(fid);
@@ -3934,7 +3989,13 @@ public:
                                                     else if (i < fn->defaults.size() && fn->defaults[i]) fn_ctx->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
                                                     else fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
                                                 }
-                                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {} catch (...) {}
+                                                // A bare `return` inside __init__ is legitimate control
+                                                // flow (ReturnSignal) and is swallowed here; anything
+                                                // else — NameError, a user exception, IndexError — must
+                                                // propagate like it does for every other function call,
+                                                // not be silently discarded (see NythonExecutor.hpp's
+                                                // other ReturnSignal-only catches for the same pattern).
+                                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
                                                 break;
                                             }
                                         }
@@ -4172,7 +4233,9 @@ public:
                                     fn_ctx->defineByName("__parent_class__", makeStringValue(pname));
                                     fn_ctx->defineByName("__instance__", instance);
                                 }
-                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {} catch (...) {}
+                                // See the identical comment on the other __init__ call sites in
+                                // this file: only ReturnSignal (a bare `return`) is swallowed here.
+                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
                             }
                         }
                     }
@@ -4217,7 +4280,6 @@ public:
                                         }
                                         try { evalNode(fn->body, fn_ctx); }
                                         catch (nython::node::ReturnSignal&) {}
-                                        catch (...) {}
                                         break;
                                     }
                                 }
@@ -5916,7 +5978,33 @@ public:
         auto nn = static_pointer_cast<NameSpaceNode>(node);
         Context* ns_ctx = new Context(runner, nn->name, nullptr, nullptr, ctx);
         if (nn->body) evalNode(nn->body, ns_ctx);
-        return NONE_VALUE;
+        // The body ran in ns_ctx, but ns_ctx itself was never exposed under
+        // the namespace's own name in the OUTER scope - `namespace ns: var
+        // thing = 42` left `ns` completely undefined outside the block, so
+        // `ns.thing` always read none. Collect the namespace's own
+        // top-level names (matching how `import "m" as alias` builds its
+        // namespace map elsewhere in this file) into a map bound to its
+        // name, so it can actually be used from outside.
+        auto* obj = new Object((Runnable*)runner, nn->name, Type::MAP);
+        if (nn->body) {
+            for (auto& stmt : nn->body->statements()) {
+                std::string member_name;
+                if (stmt->type() == NodeType::VARIABLE_DECL)
+                    member_name = static_pointer_cast<VarDeclNode>(stmt)->name;
+                else if (stmt->type() == NodeType::FUNCTION)
+                    member_name = static_pointer_cast<FunctionNode>(stmt)->name;
+                else if (stmt->type() == NodeType::CLASS)
+                    member_name = static_pointer_cast<ClassNode>(stmt)->name;
+                if (member_name.empty()) continue;
+                try { (*obj->container)[member_name] = ns_ctx->getByName(member_name); }
+                catch (...) {}
+            }
+        }
+        (*obj->container)["__name__"] = makeStringValue(nn->name);
+        (*obj->container)["__type__"] = makeStringValue("namespace");
+        Value ns_val((Collectable*)obj);
+        ctx->defineByName(nn->name, ns_val);
+        return ns_val;
     }
 
     // ─── HELPER ─────────────────────────────────────────────────────────

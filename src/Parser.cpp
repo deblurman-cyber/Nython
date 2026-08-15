@@ -99,7 +99,7 @@ bool Parser::isCompoundStatement(){
     return see(TokenType::Colon)||see(TokenType::Block)||see(TokenType::If)||see(TokenType::While)
         ||see(TokenType::For)||see(TokenType::Try)||see(TokenType::With)||see(TokenType::Def)
         ||see(TokenType::Function)||see(TokenType::Fn)||see(TokenType::Fun)||see(TokenType::Var)||see(TokenType::Let)||see(TokenType::Const)||see(TokenType::Ref)
-        ||see(TokenType::Class)||see(TokenType::Unless)||see(TokenType::Interface)||see(TokenType::Typeof)||see(TokenType::Sizeof)||see(TokenType::Global)||see(TokenType::Loop)||see(TokenType::Block)||see(TokenType::Repeat)
+        ||see(TokenType::Class)||see(TokenType::Unless)||see(TokenType::Interface)||see(TokenType::Struct)||see(TokenType::Typeof)||see(TokenType::Sizeof)||see(TokenType::Global)||see(TokenType::Loop)||see(TokenType::Block)||see(TokenType::Repeat)
         ||see(TokenType::Enum)||see(TokenType::Switch)||see(TokenType::NameSpace)||see(TokenType::Repeat);
 }
 
@@ -111,7 +111,7 @@ bool Parser::isAugAssign(){
         ||see(TokenType::XorAssign)||see(TokenType::BinAndAssign)||see(TokenType::BinOrAssign)
         ||see(TokenType::BinXorAssign)||see(TokenType::ModAssign)||see(TokenType::RevDivAssign)
         ||see(TokenType::ExpAssign)||see(TokenType::ShiftLeftAssign)||see(TokenType::ShiftRightAssign)
-        ||see(TokenType::ShiftAssign);
+        ||see(TokenType::ShiftAssign)||see(TokenType::ComplementAssign);
 }
 
 bool Parser::isOperator(){
@@ -347,6 +347,7 @@ node_ptr Parser::statement(){
     }
     if(see(TokenType::Class)) return classDecl();
     if(see(TokenType::Interface)) return interfaceDecl();
+    if(see(TokenType::Struct)) return structDecl();
     if(see(TokenType::Typeof)||see(TokenType::Sizeof)) {
         Token tok = token();
         std::string fn_name = tok.value == "typeof" ? "type" : "len";
@@ -806,6 +807,27 @@ node_ptr Parser::power(){
 }
 
 node_ptr Parser::unary(){
+    if(have(TokenType::New)){
+        // `new` had no parsing rule at all - it fell into the "keyword
+        // usable as an identifier" lists (see identifier() and the
+        // primary() fallback), so `new A()` parsed as two disconnected
+        // fragments: a reference to a nonexistent variable named "new",
+        // then an orphaned `A()` the statement parser had to resynchronize
+        // past at the next newline. `new A` read the same way, silently
+        // discarding "A" entirely.
+        //
+        // `new A()` and `new A()` should differ from bare `A`/`A()`:
+        // `A` alone names the class value itself; `A()` and `new A()` both
+        // instantiate; `new A` (no explicit parens) also instantiates, with
+        // zero arguments, the same as `A()` - "new" makes instantiation
+        // explicit rather than changing what gets built.
+        Token new_tok = prev();
+        node_ptr target = postfix();
+        if(target->type() != NodeType::CALL){
+            target = make_node<CallNode>(new_tok, target);
+        }
+        return target;
+    }
     if(have(TokenType::Add)||have(TokenType::Sub)||have(TokenType::Not)||have(TokenType::Complement)
       ||have(TokenType::DoubleAdd)||have(TokenType::DoubleSub)){
         Token op = prev();
@@ -1807,6 +1829,76 @@ node_ptr Parser::interfaceDecl(){
     have(TokenType::Colon);
     node_ptr body = blockOrStmt();
     return make_node<InterfaceNode>(tok, name, body);
+}
+
+// `struct Point: x, y=0` (comma or newline separated, brace or indent
+// block - same grammar as enumDecl just below) desugars to a class with an
+// auto-generated `__init__(self, x, y=0): self.x = x; self.y = y`. A
+// value-carrying record IS what a class with only that constructor already
+// is here, so reusing ClassNode means inheritance, is_a, the object
+// protocol, and both engines' class compilation all work for structs with
+// no separate implementation anywhere else in either engine.
+node_ptr Parser::structDecl(){
+    Token tok = token();
+    mustBe(TokenType::Struct);
+    std::string name = identifier();
+    have(TokenType::Colon);
+    bool has_brace = have(TokenType::BraceOpen);
+    have(TokenType::NewLine);
+    bool has_indent = have(TokenType::Indent);
+    auto end_check = [&]() -> bool {
+        if(has_brace) return see(TokenType::BraceClose);
+        if(has_indent) return see(TokenType::Dedent);
+        return see(TokenType::End)||see(TokenType::NewLine);
+    };
+    std::vector<Token> field_toks;
+    std::vector<node_ptr> field_defaults;
+    while(!end_check()&&!see(TokenType::End)){
+        while(have(TokenType::NewLine)) {}
+        if(end_check()) break;
+        Token ftok = token();
+        std::string fname = identifier();
+        ftok.value = fname;
+        node_ptr fdefault = nullptr;
+        if(have(TokenType::Assign)) fdefault = expression();
+        field_toks.push_back(ftok);
+        field_defaults.push_back(fdefault);
+        have(TokenType::Comma); have(TokenType::NewLine);
+    }
+    if(has_indent) have(TokenType::Dedent);
+    if(has_brace) have(TokenType::BraceClose);
+
+    Token self_tok = tok; self_tok.value = "self";
+    auto init_body = make_node<BlockNode>(tok);
+    for(auto& ftok : field_toks){
+        // `self` inside a method body must be a SelfNode, not a generic
+        // VariableNode referencing a variable named "self" - the VM
+        // compiles the two completely differently (visit(), NT::SELF vs
+        // NT::VARIABLE): real `self.x` compiles to a dedicated LOAD_SELF
+        // opcode, while a VariableNode named "self" compiles to
+        // LOAD_NAME "self", an ordinary name lookup that finds nothing
+        // (self isn't bound as a regular local - it's carried on the call
+        // frame instead), so `self.x = x` silently wrote to none.x and
+        // every struct field field read back none. Only the PARAMETER
+        // declaration below (`self` as the first param name) stays a
+        // VariableNode; it's just a name there, not a self-reference.
+        auto self_ref = make_node<SelfNode>(self_tok);
+        auto target = make_node<AttributeNode>(ftok, self_ref, ftok.value);
+        auto value = make_node<VariableNode>(ftok);
+        init_body->add(make_node<AssignmentNode>(ftok, target, value));
+    }
+    auto init_fn = make_node<FunctionNode>(tok, "__init__", init_body, true);
+    init_fn->add(make_node<VariableNode>(self_tok));
+    std::vector<node_ptr> defaults; defaults.push_back(nullptr);
+    for(size_t i=0;i<field_toks.size();i++){
+        init_fn->add(make_node<VariableNode>(field_toks[i]));
+        defaults.push_back(field_defaults[i]);
+    }
+    static_cast<FunctionNode*>(init_fn.get())->defaults = std::move(defaults);
+
+    auto class_body = make_node<BlockNode>(tok);
+    class_body->add(init_fn);
+    return make_node<ClassNode>(tok, name, class_body);
 }
 
 node_ptr Parser::enumDecl(){

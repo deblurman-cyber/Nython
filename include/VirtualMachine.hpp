@@ -84,6 +84,13 @@ enum class Op : uint8_t {
     LIST_EXTEND, LIST_APPEND, LOAD_SUPER,
     RAISE, STORE_EXCEPT_AS,
     LOAD_SELF_ATTR, STORE_SELF_ATTR,
+    // `===`/`!==` (strict: no int/float coercion, unlike COMPARE_EQ) and
+    // logical `xor`/`^^` (truthiness xor - BINARY_XOR above is the bitwise
+    // `^`, a different operator). These parsed into a BinaryNode fine but
+    // bin_op() had no case for any of the three, so they compiled to NOP -
+    // the operands were left on the stack instead of being combined and
+    // consumed, corrupting whatever ran next (see HANDOFF.md).
+    COMPARE_SEQ, COMPARE_SNE, LOGICAL_XOR,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -225,8 +232,28 @@ struct VMVal {
 struct ExceptionEntry {
     int try_start = 0;
     int try_end   = 0;
-    int handler   = 0;
-    std::string alias;  // variable to bind exception message to
+    // One entry per `except` clause, tried in source order - mirrors the
+    // interpreter's evalTry (NythonExecutor.hpp), which walks tn->except_clauses
+    // and runs the first one whose declared type matches (or is a parent of)
+    // the raised exception's type, or that has no declared type at all. The
+    // VM used to have a single `handler`/`alias` here and always ran the
+    // FIRST except clause's body regardless of its declared type - every
+    // other clause's body wasn't even compiled.
+    struct Clause {
+        std::string type_name;   // empty = catch-all, matches any exception
+        std::string bind_var;    // empty = don't bind (bare "except:")
+        int handler = 0;         // bytecode offset of this clause's body
+    };
+    std::vector<Clause> clauses;
+    // Bytecode offset of the `else` clause's body (runs only if the try body
+    // did NOT raise), or -1 if there is none. Previously not compiled at all.
+    int else_handler = -1;
+    // Offset immediately after the whole try/except/else, used when an
+    // exception is raised but no clause's type matches - the interpreter
+    // silently falls through to `finally` in that case rather than
+    // re-raising, so the VM matches that instead of leaving the exception
+    // to propagate further up.
+    int end = 0;
 };
 
 struct VMCode {
@@ -374,6 +401,21 @@ class Compiler {
     void emit_dn(const std::string& n,int l=0){ emit(Op::DEFINE_NAME,C().add_name(n),l); }
     int  ln(nython::node::node_ptr nd) { return nd?nd->token().location().row:0; }
 
+    // Integer literal tokens keep their source spelling verbatim
+    // ("0xFF", "0o17", "0b1010"), but plain std::stoll(s) - base 10 by
+    // default - stops at the first non-decimal digit, so it silently
+    // parsed just the leading "0" of every one of these and returned 0,
+    // instead of 255/15/10. Matches the interpreter's evalInteger
+    // (NythonExecutor.hpp), which already does this prefix check.
+    static int64_t parse_int_literal(const std::string& v){
+        if(v.size()>2 && v[0]=='0'){
+            if(v[1]=='x'||v[1]=='X') return std::stoll(v,nullptr,16);
+            if(v[1]=='o'||v[1]=='O') return std::stoll(v.substr(2),nullptr,8);
+            if(v[1]=='b'||v[1]=='B') return std::stoll(v.substr(2),nullptr,2);
+        }
+        return std::stoll(v);
+    }
+
     static constexpr int BREAK_PH=-9991, CONT_PH=-9992;
     // is_for: the loop keeps an iterator on the value stack between iterations
     // (pushed by GET_ITER, popped by FOR_ITER on exhaustion). A `break` jumps
@@ -413,7 +455,7 @@ private:
         if(nd->type()==NT::WALRUS) std::cerr<<"[DBG] visit WALRUS node!\n";
         switch(nd->type()) {
         // Literals
-        case NT::INTEGER: emit_lc(VMVal::make_int(std::stoll(nd->token().value)),l); break;
+        case NT::INTEGER: emit_lc(VMVal::make_int(parse_int_literal(nd->token().value)),l); break;
         case NT::FLOAT:   emit_lc(VMVal::make_float(std::stod(nd->token().value)),l); break;
         case NT::STRING:  emit_lc(VMVal::make_str(nd->token().value),l); break;
         case NT::TRUE:    emit_lc(VMVal::make_bool(true),l); break;
@@ -479,6 +521,17 @@ private:
         }
         case NT::ASSIGNMENT_AUG: {
             auto an=std::static_pointer_cast<nython::node::AugAssignNode>(nd);
+            if(an->op=="~="){
+                // No natural binary reading of "complement" exists (see the
+                // identical comment on the interpreter's evalAugAssignment,
+                // NythonExecutor.hpp): `x ~= y` assigns the bitwise
+                // complement of y to x, discarding the old x rather than
+                // combining with it - doesn't fit the load-target/combine
+                // pattern below.
+                visit(an->value_node);
+                emit(Op::UNARY_BITNOT,0,l);
+                store(an->target,l); break;
+            }
             // Load current value of target
             load_target(an->target,l);
             // Load new value and apply op
@@ -501,8 +554,23 @@ private:
         // Unary
         case NT::UNARY: {
             auto u=std::static_pointer_cast<nython::node::UnaryNode>(nd);
-            visit(u->operand);
             std::string op=u->op;
+            if(op=="++"||op=="--"){
+                // Post-increment/decrement: `x++` evaluates to the OLD
+                // value but updates the variable/attribute/subscript to
+                // old+-1, matching the interpreter's evalUnary
+                // (NythonExecutor.hpp). This used to fall through to the
+                // `else` branch below (UNARY_POS, a no-op on the loaded
+                // value) - `x++` compiled to reading x and discarding it:
+                // no increment, no write-back, at all.
+                load_target(u->operand,l);
+                emit(Op::DUP_TOP,0,l);
+                emit_lc(VMVal::make_int(1),l);
+                emit(op=="++"?Op::IADD:Op::ISUB,0,l);
+                store(u->operand,l);
+                break;
+            }
+            visit(u->operand);
             if(op=="-"||op=="neg")      emit(Op::UNARY_NEG,0,l);
             else if(op=="not"||op=="!") emit(Op::UNARY_NOT,0,l);
             else if(op=="~")            emit(Op::UNARY_BITNOT,0,l);
@@ -529,13 +597,20 @@ private:
             // variable — which since round 52 raises NameError rather than
             // yielding none. A distinct opcode carrying the name as a constant
             // keeps `x is int` and `x is "int"` different things.
-            if((op=="is"||op=="is not") && b->right
+            // `instanceof` is a second spelling of `is` (see bin_op() and
+            // the interpreter's evalBinary, NythonExecutor.hpp) and needs
+            // the same type-name special case - without it, `a instanceof
+            // Animal` fell to the generic bin_op() path below, which maps
+            // straight to COMPARE_IS (plain value/pointer equality between
+            // the instance and the class itself, never true) instead of
+            // this opcode's actual type check.
+            if((op=="is"||op=="is not"||op=="instanceof") && b->right
                && b->right->type()==NT::VARIABLE){
                 const std::string& tn=b->right->token().value;
                 if(isTypeNameToken(tn)){
                     visit(b->left);
                     emit_lc(VMVal::make_str(tn),l);
-                    emit(op=="is"?Op::COMPARE_IS_TYPE:Op::COMPARE_IS_NOT_TYPE,0,l);
+                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE,0,l);
                     break;
                 }
             }
@@ -696,8 +771,22 @@ private:
             auto sw=std::static_pointer_cast<nython::node::SwitchNode>(nd);
             visit(sw->subject);
             std::vector<int> end_jumps;
+            bool wildcard_handled=false;
             for(auto& c:sw->cases){
                 auto cn=std::static_pointer_cast<nython::node::CaseNode>(c);
+                // Python-style `case _:` wildcard. The interpreter's
+                // evalSwitch (NythonExecutor.hpp) special-cases a case value
+                // of exactly "_" as always-match rather than a variable
+                // lookup; this compiled it as an ordinary comparison
+                // instead (subject == <value of undefined name _>, which
+                // reads none and is never equal), so `case _:` never ran
+                // on the VM.
+                if(cn->value_node && cn->value_node->value()=="_"){
+                    emit(Op::POP_TOP,0,l);
+                    if(cn->body) visit(cn->body);
+                    wildcard_handled=true;
+                    break;
+                }
                 emit(Op::DUP_TOP,0,l);
                 visit(cn->value_node);
                 emit(Op::COMPARE_EQ,0,l);
@@ -707,14 +796,84 @@ private:
                 end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
                 C().patch(jf,C().here());
             }
-            emit(Op::POP_TOP,0,l);
-            if(sw->default_case) visit(sw->default_case);
+            if(!wildcard_handled){
+                emit(Op::POP_TOP,0,l);
+                if(sw->default_case) visit(sw->default_case);
+            }
             int end=C().here();
             for(int j:end_jumps) C().patch(j,end);
             break;
         }
         // Class
         case NT::CLASS: visit_class(std::static_pointer_cast<nython::node::ClassNode>(nd)); break;
+        // Enum - previously fell to `default: NOP`, silently dropping the
+        // whole declaration (the interpreter's evalEnum, NythonExecutor.hpp,
+        // already builds a real map of name->value; this compiles the same
+        // shape via BUILD_MAP, reusing the NT::MAP pattern just above).
+        case NT::ENUM: {
+            auto en=std::static_pointer_cast<nython::node::EnumNode>(nd);
+            int counter=0;
+            for(auto& item:en->items){
+                auto ei=std::static_pointer_cast<nython::node::EnumItemNode>(item);
+                emit_lc(VMVal::make_str(ei->name),l);
+                if(ei->value_node) visit(ei->value_node);
+                else emit_lc(VMVal::make_int(counter),l);
+                counter++;
+            }
+            emit(Op::BUILD_MAP,(int)en->items.size(),l);
+            emit_dn(en->name,l);
+            break;
+        }
+        // Namespace - previously dropped entirely (default: NOP), including
+        // its body, so nothing inside a `namespace ns:` block ever ran on
+        // the VM. Compiles the body normally (its statements define names
+        // the ordinary way) then collects the namespace's own top-level
+        // names into a map bound to its name, mirroring the interpreter's
+        // evalNamespace fix (NythonExecutor.hpp) so `ns.thing` resolves.
+        // Unlike the interpreter's child-Context version, the body's names
+        // are NOT isolated from the enclosing scope here (the VM has no
+        // equivalent lightweight child scope to run a statement list in) -
+        // `thing` ends up reachable both bare and as `ns.thing`. A closer
+        // match would need real block-scoping, which `block:` also lacks
+        // (see HANDOFF.md) and is out of scope for this fix.
+        case NT::NAMESPACE: {
+            auto nn=std::static_pointer_cast<nython::node::NameSpaceNode>(nd);
+            std::vector<std::string> member_names;
+            if(nn->body) for(auto& stmt:nn->body->statements()){
+                std::string mn;
+                if(stmt->type()==NT::VARIABLE_DECL) mn=std::static_pointer_cast<nython::node::VarDeclNode>(stmt)->name;
+                else if(stmt->type()==NT::FUNCTION) mn=std::static_pointer_cast<nython::node::FunctionNode>(stmt)->name;
+                else if(stmt->type()==NT::CLASS) mn=std::static_pointer_cast<nython::node::ClassNode>(stmt)->name;
+                if(!mn.empty()) member_names.push_back(mn);
+            }
+            if(nn->body) for(auto& s:nn->body->statements()) visit(s);
+            for(auto& mn:member_names){ emit_lc(VMVal::make_str(mn),l); emit_ln(mn,l); }
+            emit(Op::BUILD_MAP,(int)member_names.size(),l);
+            emit_dn(nn->name,l);
+            break;
+        }
+        // Interface - bound as a real class (same MAKE_CLASS path as
+        // NT::CLASS just above) so `implements MyInterface` - which
+        // Parser.cpp's classDecl stores as an extra base, the same list a
+        // `class Foo(Bar):` parent occupies - resolves to something real,
+        // matching the interpreter's fix (evalInterfaceDecl,
+        // NythonExecutor.hpp). Previously dropped entirely (default: NOP),
+        // including its body.
+        case NT::INTERFACE: {
+            auto in_=std::static_pointer_cast<nython::node::InterfaceNode>(nd);
+            push_code(in_->name,true);
+            code_->is_class=true;
+            if(in_->body) for(auto& s:in_->body->statements()) visit(s);
+            emit(Op::HALT,0,l);
+            pop_code();
+            int idx=(int)C().sub_codes.size()-1;
+            emit(Op::MAKE_CLASS,idx,l); emit_dn(in_->name,l);
+            break;
+        }
+        // Package - a cosmetic declaration on the interpreter too
+        // (PackageNode::eval is a pure no-op, ASTNodes.hpp); NOP is the
+        // correct, matching behaviour, not a gap.
+        case NT::PACKAGE: break;
         // Call
         case NT::CALL: visit_call(std::static_pointer_cast<nython::node::CallNode>(nd)); break;
 
@@ -855,46 +1014,51 @@ private:
             auto tn=std::static_pointer_cast<nython::node::TryNode>(nd);
             ExceptionEntry ee;
             ee.try_start = C().here();
-            // Collect alias from first except clause
-            if(!tn->except_clauses.empty()){
-                auto en=std::static_pointer_cast<nython::node::ExceptNode>(tn->except_clauses[0]);
-                ee.alias=en->alias;
-            }
             // Compile try body
             if(tn->body) visit(tn->body);
             ee.try_end = C().here();
-            // Jump over handler if no exception
+            // Jump over the handlers when no exception was raised.
             int jmp_over = C().here(); emit(Op::JUMP_FORWARD,0,l);
-            // Handler starts here
-            ee.handler = C().here();
-            // Register exception entry
-            C().exc_table.push_back(ee);
-            // Compile each except clause
-            bool first=true;
+            // Compile EVERY except clause as its own handler entry point -
+            // previously only the first clause's body was even compiled, so
+            // `except TypeError:` after `except ValueError:` was dead code
+            // and every exception ran the ValueError handler regardless of
+            // its actual type. Which handler to jump to is decided at
+            // runtime by match_except_handler(), comparing the raised
+            // exception's type against each clause's type_name in order -
+            // mirroring the interpreter's evalTry (NythonExecutor.hpp).
+            std::vector<int> end_jumps;
+            auto compile_clause=[&](const std::string& type_filter, const std::string& bind_var, node_ptr body){
+                ExceptionEntry::Clause cl;
+                cl.type_name=type_filter; cl.bind_var=bind_var;
+                cl.handler=C().here();
+                if(!bind_var.empty()) emit_dn(bind_var,l);
+                else emit(Op::POP_TOP,0,l);
+                if(body) visit(body);
+                end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
+                ee.clauses.push_back(std::move(cl));
+            };
             for(auto& ec:tn->except_clauses){
                 auto en=std::static_pointer_cast<nython::node::ExceptNode>(ec);
-                if(first){
-                    // Determine binding variable:
-                    // 'except e:'          → name="e", alias=""  → bind to name
-                    // 'except Err as e:'   → name="Err", alias="e" → bind to alias
-                    // 'except:'            → name="", alias=""   → discard
-                    std::string bind_var = en->alias.empty() ? en->name : en->alias;
-                    // Only bind if it looks like a variable (lowercase first char)
-                    // and is not an exception class name (uppercase)
-                    bool is_var = !bind_var.empty() && (std::islower(bind_var[0]) || bind_var[0]=='_');
-                    if(is_var){
-                        emit_dn(bind_var,l); // TOS = exception message → store in var
-                    } else {
-                        emit(Op::POP_TOP,0,l);
-                    }
-                    if(en->body) visit(en->body);
-                    first=false;
-                }
+                // 'except e:'          -> name="e", alias=""    -> catch-all, bind "e"
+                // 'except Err as e:'    -> name="Err", alias="e"  -> type "Err", bind "e"
+                // 'except:'            -> name="", alias=""     -> catch-all, no bind
+                bool has_type = !en->alias.empty();
+                compile_clause(has_type?en->name:std::string(), has_type?en->alias:en->name, en->body);
             }
             if(tn->except_clauses.empty()){
-                emit(Op::POP_TOP,0,l); // discard exception message
+                // try/finally with no except at all: give the dispatch a
+                // catch-all landing spot that just discards the exception.
+                compile_clause(std::string(),std::string(),nullptr);
             }
+            // No-exception path (and "no clause matched") lands here.
             C().patch(jmp_over,C().here());
+            ee.else_handler = tn->else_clause ? C().here() : -1;
+            if(tn->else_clause) visit(tn->else_clause);
+            int end_pos=C().here();
+            for(int j:end_jumps) C().patch(j,end_pos);
+            ee.end=end_pos;
+            C().exc_table.push_back(ee);
             if(tn->finally_clause) visit(tn->finally_clause);
             break;
         }
@@ -1070,7 +1234,7 @@ private:
             if(i<(int)fn->defaults.size()&&fn->defaults[i]){
                 auto& dn=fn->defaults[i];
                 switch(dn->type()){
-                    case NT::INTEGER: dflt=VMVal::make_int(std::stoll(dn->token().value)); break;
+                    case NT::INTEGER: dflt=VMVal::make_int(parse_int_literal(dn->token().value)); break;
                     case NT::FLOAT:   dflt=VMVal::make_float(std::stod(dn->token().value)); break;
                     case NT::STRING:  dflt=VMVal::make_str(dn->token().value); break;
                     case NT::TRUE:    dflt=VMVal::make_bool(true); break;
@@ -1292,6 +1456,13 @@ private:
         if(op=="not in") return Op::COMPARE_NOT_IN;
         if(op=="is") return Op::COMPARE_IS;
         if(op=="is not") return Op::COMPARE_IS_NOT;
+        // `instanceof` is a second spelling of `is` for class-membership
+        // checks (`x instanceof MyClass`), matching the interpreter
+        // (NythonExecutor.hpp), which folds it into the same "is" branch.
+        if(op=="instanceof") return Op::COMPARE_IS;
+        if(op=="==="||op=="equals") return Op::COMPARE_SEQ;
+        if(op=="!==") return Op::COMPARE_SNE;
+        if(op=="xor"||op=="^^") return Op::LOGICAL_XOR;
         return Op::NOP;
     }
     static Op aug_op(const std::string& op) {
@@ -1300,6 +1471,17 @@ private:
         if(op=="*=") return Op::IMUL;
         if(op=="/=") return Op::BINARY_DIV;
         if(op=="%=") return Op::BINARY_MOD;
+        // These fell through to NOP, which the ASSIGNMENT_AUG case treats as
+        // "combine target and new value" - with no combining opcode emitted,
+        // the target was just silently replaced by the right-hand operand
+        // (x=24; x//=5 left x==5, the unmodified operand, instead of 4).
+        if(op=="//="||op=="\\=") return Op::BINARY_FLOOR_DIV;
+        if(op=="**=") return Op::BINARY_POW;
+        if(op=="&=") return Op::BINARY_AND;
+        if(op=="|=") return Op::BINARY_OR;
+        if(op=="^=") return Op::BINARY_XOR;
+        if(op=="<<=") return Op::BINARY_LSHIFT;
+        if(op==">>="||op==">>>=") return Op::BINARY_RSHIFT;
         return Op::NOP;
     }
 };
@@ -1910,6 +2092,23 @@ private:
                 if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__ne__",{r});if(res.type!=VMType::NONE){push(res);break;}}
                 push(VMVal::make_bool(lv!=r)); break;
             }
+            case Op::COMPARE_SEQ: {
+                // Strict equality: same type AND same value, no int/float
+                // coercion (unlike ==) - matches the interpreter's "===".
+                VMVal r=pop(),lv=pop();
+                push(VMVal::make_bool(lv.type==r.type && lv==r)); break;
+            }
+            case Op::COMPARE_SNE: {
+                VMVal r=pop(),lv=pop();
+                push(VMVal::make_bool(!(lv.type==r.type && lv==r))); break;
+            }
+            case Op::LOGICAL_XOR: {
+                // Truthiness xor - true when exactly one side is truthy,
+                // matching the interpreter's "xor"/"^^" (distinct from the
+                // bitwise `^`, which is BINARY_XOR).
+                VMVal r=pop(),lv=pop();
+                push(VMVal::make_bool(lv.is_truthy()!=r.is_truthy())); break;
+            }
             case Op::COMPARE_LT: {
                 VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__lt__",{r});if(res.type!=VMType::NONE){push(res);break;}}
@@ -2374,7 +2573,7 @@ private:
                 for(auto& ee : fr.code->exc_table){
                     if(ip_at_raise >= ee.try_start && ip_at_raise < ee.try_end){
                         push(exc_obj);
-                        fr.ip = ee.handler;
+                        fr.ip = match_except_handler(ee, exc_obj);
                         handled = true;
                         last_exception_obj_=VMVal::make_none();
                         break;
@@ -2418,14 +2617,25 @@ private:
                 for(auto& ee:fr2.code->exc_table){
                     if(ip_at_raise>=ee.try_start && ip_at_raise<=ee.try_end){
                         push(exc_val);
-                        fr2.ip=ee.handler;
+                        fr2.ip=match_except_handler(ee, exc_val);
                         handled=true; break;
                     }
                 }
-                // 2) Fallback: find SETUP_EXCEPT instruction
+                // 2) Fallback: find SETUP_EXCEPT instruction (used by `with`,
+                // see NT::WITH). Must skip any SETUP_EXCEPT whose block
+                // already exited normally (reached its matching END_EXCEPT)
+                // - otherwise an exception raised anywhere after a completed
+                // `with` block, with nothing else to catch it, walked back
+                // into that `with`'s stale handler instead of propagating,
+                // re-ran the code after the `with` block, hit the same raise
+                // again, and looped forever.
                 if(!handled){
+                    int skip=0;
                     for(int i=fr2.ip-1;i>=0;i--){
-                        if(fr2.code->instructions[i].op==Op::SETUP_EXCEPT){
+                        Op op2=fr2.code->instructions[i].op;
+                        if(op2==Op::END_EXCEPT){ skip++; continue; }
+                        if(op2==Op::SETUP_EXCEPT){
+                            if(skip>0){ skip--; continue; }
                             push(exc_val);
                             fr2.ip=fr2.code->instructions[i].arg;
                             handled=true; break;
@@ -2544,9 +2754,12 @@ private:
         double a=to_d(l),b=to_d(r);
         if(b==0.0) throw std::runtime_error("ZeroDivisionError: division by zero");
         if(floor_div) return VMVal::make_int((int64_t)std::floor(a/b));
-        // Return int when both operands are ints and result is exact
-        if(l.type==VMType::INT&&r.type==VMType::INT&&r.i!=0&&l.i%r.i==0)
-            return VMVal::make_int(l.i/r.i);
+        // `/` is true division and always returns a float, matching the
+        // interpreter (NythonExecutor.hpp: "Return float (true division) -
+        // use // for integer division") and Python. This used to return an
+        // int whenever the division was exact (10/2 -> int 5), which is a
+        // real engine divergence documented in HANDOFF.md 5.4 - resolved by
+        // an explicit ruling: 10/2 == 5.0, 10//2 == 10\2 == 5.
         return VMVal::make_float(a/b);
     }
     static VMVal op_mod(const VMVal& l, const VMVal& r) {
@@ -2655,6 +2868,30 @@ private:
         if(cont.type==VMType::MAP&&cont.map)
             return cont.map->count(item.to_string())>0;
         return false;
+    }
+    // Which except clause (if any) a raised exception should run: the first
+    // whose declared type is empty (catch-all), one of the generic
+    // Exception/BaseException/Error names, equal to the exception's own
+    // type, or a parent of it. Mirrors the interpreter's evalTry
+    // (NythonExecutor.hpp) type-matching, including its silent fall-through
+    // to `finally` (ee.end) when nothing matches rather than re-raising.
+    int match_except_handler(const ExceptionEntry& ee, const VMVal& exc_val) {
+        std::string exc_type = exc_val.type==VMType::INSTANCE ? exc_val.class_name : std::string();
+        for(auto& cl : ee.clauses){
+            if(cl.type_name.empty()) return cl.handler;
+            if(exc_type.empty()) continue; // typed clause, untyped exception: no match
+            if(exc_type==cl.type_name || cl.type_name=="Exception"
+               || cl.type_name=="BaseException" || cl.type_name=="Error")
+                return cl.handler;
+            std::string cur=exc_type; int guard=0;
+            while(!cur.empty() && guard++<16){
+                auto cit=class_reg_.find(cur);
+                if(cit==class_reg_.end()) break;
+                cur=cit->second->parent_class;
+                if(cur==cl.type_name) return cl.handler;
+            }
+        }
+        return ee.end;
     }
     bool value_is_type(const VMVal& v, const std::string& want) {
         // Everything is an Object.
@@ -3071,7 +3308,13 @@ private:
                 if(held.type==VMType::NATIVE)
                     return vm_call(held,args,std::nullopt);
                 if(held.type==VMType::FUNCTION)
-                    return exec_code(held.code,args,obj);
+                    // held.closure_env must come along too, or a closure
+                    // stored in an attribute and invoked as obj.attr()
+                    // silently loses every captured variable (they read
+                    // back as none) the moment it's called this way instead
+                    // of via a plain local reference (`f = obj.attr; f()`,
+                    // which already passed callee.closure_env correctly).
+                    return exec_code(held.code,args,obj,held.closure_env);
             }
         }
         if(obj.type==VMType::INSTANCE){
@@ -3082,6 +3325,47 @@ private:
                 for(auto& sub:cit->second->sub_codes)
                     if(sub->name==method&&!sub->is_class) return exec_code(sub,args,obj);
                 cls=cit->second->parent_class;
+            }
+            // Universal object protocol — mirrors NythonExecutor::objectProtocol
+            // on the interpreter (see test_25_object_protocol.ny, which probes
+            // for support and skipped here because the VM had none of this).
+            // Only reached once no user-defined method/attribute of this name
+            // was found above, so a class's own to_string/class_name etc, if
+            // it defines one, still wins.
+            if(method=="class_name"||method=="type_name")
+                return VMVal::make_str(obj.class_name);
+            if(method=="to_string"||method=="str")
+                return VMVal::make_str("<"+obj.class_name+" instance>");
+            if(method=="id"){
+                uintptr_t raw=obj.map?(uintptr_t)obj.map.get():0;
+                return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
+            }
+            if(method=="hash"){
+                uintptr_t raw=obj.map?(uintptr_t)obj.map.get():0;
+                uint64_t h=std::hash<std::string>{}(obj.class_name+"|"+std::to_string(raw));
+                return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));
+            }
+            if(method=="is_a"||method=="instance_of"){
+                if(args.empty()) return VMVal::make_bool(false);
+                std::string want=args[0].to_string();
+                std::string cur=obj.class_name;
+                int guard=0;
+                while(!cur.empty()&&guard++<64){
+                    if(cur==want) return VMVal::make_bool(true);
+                    auto cit=class_reg_.find(cur);
+                    if(cit==class_reg_.end()) break;
+                    cur=cit->second->parent_class;
+                }
+                return VMVal::make_bool(false);
+            }
+            if(method=="equals_to"||method=="same_as"){
+                if(args.empty()||args[0].type!=VMType::INSTANCE) return VMVal::make_bool(false);
+                return VMVal::make_bool(obj.map.get()==args[0].map.get());
+            }
+            if(method=="fields"||method=="attributes"){
+                std::vector<VMVal> r;
+                if(obj.map) for(auto& kv:*obj.map) r.push_back(VMVal::make_str(kv.first));
+                return VMVal::make_list(std::move(r));
             }
         }
         // CLASS.method(self, args...) — parent class method call pattern
@@ -3216,6 +3500,19 @@ private:
         if(globals_.count(guard_key) && alias.empty()) return;
         globals_[guard_key] = VMVal::make_bool(true);
         if(name=="nytorch"){ register_nytorch_builtins(); return; }
+        // "nytorch_classes" used to sit in builtin_modules below - a no-op
+        // acknowledgement, on the theory its functions were "already
+        // registered as globals". That's true of the native tensor_* ops
+        // (register_nytorch_builtins), but the class library itself
+        // (Tensor, and everything built on it, in lib/nytorch.ny) was never
+        // actually loaded, so `Tensor(...)` read as an undefined name on
+        // this engine while the interpreter's own `nytorch_classes` handler
+        // (NythonExecutor.hpp) really does load lib/nytorch.ny. Falling
+        // through to the normal file-import path below (via filepath) does
+        // the same here; the VM's shared_ptr-backed containers don't have
+        // the interpreter's container-leak problem that made loading this
+        // 220+-class file risky there (see GC_NOTES.md).
+        if(name=="nytorch_classes"){ register_nytorch_builtins(); }
         if(name=="os"||name=="shell"||name=="sh"){ register_os_builtins(); return; }
         if(name=="math"){ register_math_builtins(); return; }
         if(name=="time"){ register_time_builtins(); return; }
@@ -3236,7 +3533,7 @@ private:
         // just an acknowledgement.
         static const std::set<std::string> builtin_modules = {
             "random","collections","crypto","datetime","hash","http","re","regex",
-            "sys","ml","ai","net","agent_net","nytorch_classes","threading",
+            "sys","ml","ai","net","agent_net","threading",
             "thread","threads","threading_lib","string","math","time","json",
             "io","fs","file","os","sh","shell","gui","stdlib","oslib","os_lib",
             "netlib","network_lib","sockets","webserver","httpserver",
@@ -3251,6 +3548,7 @@ private:
             {"threading_lib","lib/thread.ny"},{"clientserver","lib/clientserver.ny"},
             {"cs_lib","lib/clientserver.ny"},{"gui","lib/gui.ny"},
             {"aiagent","lib/aiagent.ny"},{"nyxai","lib/aiagent.ny"},{"nyx","lib/aiagent.ny"},
+            {"nytorch_classes","lib/nytorch.ny"},
         };
         std::string filepath;
         auto it=lib_map.find(name);
@@ -3560,11 +3858,23 @@ private:
             double p=to_d(a[1]); std::vector<VMVal> r;
             for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::pow(to_d(x),p)));
             return VMVal::make_list(std::move(r));});
-        globals_["tensor_clip"]=globals_["clamp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["tensor_clip"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
             double lo=a.size()>=2?to_d(a[1]):-1e300,hi=a.size()>=3?to_d(a[2]):1e300;
             std::vector<VMVal> r; for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::max(lo,std::min(hi,to_d(x)))));
             return VMVal::make_list(std::move(r));});
+        // clamp(value, lo, hi) is the scalar builtin (see the interpreter's
+        // clamp in src/builtins/tensor.cpp) - a different function from
+        // tensor_clip, which clips every element of a LIST. These used to
+        // be aliased to the same tensor_clip native, so clamp(-5, 0, 10)
+        // hit tensor_clip's "a[0] must be a LIST" guard and returned [].
+        globals_["clamp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<3) return a.empty()?VMVal::make_none():a[0];
+            double v=to_d(a[0]),lo=to_d(a[1]),hi=to_d(a[2]);
+            if(v<lo) v=lo;
+            if(v>hi) v=hi;
+            if(a[0].type==VMType::INT) return VMVal::make_int((int64_t)v);
+            return VMVal::make_float(v);});
         globals_["tensor_where"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.size()<3)return VMVal::make_list();
             // tensor_where(cond_list, x_list, y_list)
@@ -4487,6 +4797,14 @@ private:
                 if(!a.empty())for(int64_t i=0;i<(int64_t)lst.size();i++)if(lst[i]==a[0])return VMVal::make_int(i);
                 return VMVal::make_int(-1);}
             if(m=="count"){if(a.empty())return VMVal::make_int((int64_t)lst.size());int64_t cnt=0;for(auto& v:lst)if(v==a[0])cnt++;return VMVal::make_int(cnt);}
+            // nums.min()/.max()/.sum() as method calls - only the global
+            // min(nums)/max(nums)/sum(nums) forms were implemented, so the
+            // method form fell through this whole if-chain and read none.
+            // Reuse the global natives, which already handle a list argument.
+            if(m=="min"||m=="max"||m=="sum"){
+                std::vector<VMVal> la={obj};
+                return vm->globals_[m].native(la);
+            }
             if(m=="clear"){lst.clear();return VMVal::make_none();}
             if(m=="copy"){return VMVal::make_list(std::vector<VMVal>(lst));}
             if(m=="extend"){if(!a.empty()&&a[0].list)for(auto& v:*a[0].list)lst.push_back(v);return VMVal::make_none();}
@@ -4619,7 +4937,33 @@ private:
             if(v.type==VMType::INT)return v;
             if(v.type==VMType::FLOAT)return VMVal::make_int((int64_t)v.d);
             if(v.type==VMType::BOOL)return VMVal::make_int(v.b?1:0);
-            if(v.type==VMType::STRING){try{return VMVal::make_int(std::stoll(v.s));}catch(...){}}
+            if(v.type==VMType::STRING){
+                // A parse failure was swallowed and silently returned 0, unlike
+                // the interpreter's int() (src/builtins/tensor.cpp), which
+                // raises ValueError - int("abc") looked like a successful
+                // parse of 0 instead of an error a try/except could catch.
+                // The base argument and 0x/0b/0o prefix auto-detection were
+                // also missing here (always base 10), matched to the
+                // interpreter below.
+                std::string s=v.s;
+                int base=10;
+                if(a.size()>=2&&a[1].type==VMType::INT) base=(int)a[1].i;
+                if(s.size()>2&&s[0]=='0'){
+                    if((s[1]=='x'||s[1]=='X')&&base==10) base=16;
+                    if((s[1]=='b'||s[1]=='B')&&base==10) base=2;
+                    if((s[1]=='o'||s[1]=='O')&&base==10) base=8;
+                    if(base!=10&&(s[1]=='x'||s[1]=='X'||s[1]=='b'||s[1]=='B'||s[1]=='o'||s[1]=='O'))
+                        s=s.substr(2);
+                }
+                try{
+                    size_t idx=0;
+                    long long iv=std::stoll(s,&idx,base);
+                    if(idx!=s.size()) throw std::invalid_argument("not fully consumed");
+                    return VMVal::make_int(iv);
+                }catch(...){
+                    throw std::runtime_error("ValueError: invalid literal for int(): '"+v.s+"'");
+                }
+            }
             return VMVal::make_int(0);});
         globals_["float"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_float(0.0):VMVal::make_float(to_d(a[0]));});
@@ -4801,14 +5145,45 @@ private:
                 return VMVal::make_list(std::move(r));}
             return VMVal::make_list();});
         globals_["dict"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_map();});
+        // Tag the type-constructor builtins with the type name they build, so
+        // isinstance(x, list) — passing the bare builtin, not a string — has
+        // something to compare against. Done once, after every builtin above
+        // has taken its final binding (list/dict are each registered twice;
+        // this reads whichever registration actually won), rather than at
+        // each individual registration site.
+        for(auto& nm_canon : std::vector<std::pair<std::string,std::string>>{
+                {"int","int"},{"float","float"},{"bool","bool"},{"str","str"},
+                {"string","str"},{"list","list"},{"tuple","list"},
+                {"dict","map"},{"set","list"}}){
+            auto git=globals_.find(nm_canon.first);
+            if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
+                git->second.class_name=nm_canon.second;
+        }
         globals_["isinstance"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
             VMVal& obj=a[0]; VMVal& cls=a[1];
-            if(obj.type!=VMType::INSTANCE) return VMVal::make_bool(false);
             std::string cls_name;
             if(cls.type==VMType::CLASS) cls_name=cls.class_name;
             else if(cls.type==VMType::STRING) cls_name=cls.s;
+            // isinstance(x, list) / isinstance(x, int): the bare builtin, not
+            // a string. These are tagged with the type they build above.
+            else if(cls.type==VMType::NATIVE&&!cls.class_name.empty()) cls_name=cls.class_name;
             else return VMVal::make_bool(false);
+            if(obj.type!=VMType::INSTANCE){
+                // Builtin/primitive types by name, e.g. isinstance(42, "int").
+                // Only the class-instance case below was handled, so this
+                // always read false; mirrors the interpreter's alias set
+                // (dispatch_tensor's isinstance in src/builtins/tensor.cpp).
+                if(cls_name=="int"||cls_name=="integer") return VMVal::make_bool(obj.type==VMType::INT);
+                if(cls_name=="float"||cls_name=="double") return VMVal::make_bool(obj.type==VMType::FLOAT);
+                if(cls_name=="bool"||cls_name=="boolean") return VMVal::make_bool(obj.type==VMType::BOOL);
+                if(cls_name=="str"||cls_name=="string") return VMVal::make_bool(obj.type==VMType::STRING);
+                if(cls_name=="list"||cls_name=="array") return VMVal::make_bool(obj.type==VMType::LIST);
+                if(cls_name=="map"||cls_name=="dict") return VMVal::make_bool(obj.type==VMType::MAP);
+                if(cls_name=="none") return VMVal::make_bool(obj.type==VMType::NONE);
+                if(cls_name=="function") return VMVal::make_bool(obj.type==VMType::FUNCTION||obj.type==VMType::NATIVE);
+                return VMVal::make_bool(false);
+            }
             // Walk inheritance chain
             std::string cur=obj.class_name;
             while(!cur.empty()){
@@ -5002,10 +5377,31 @@ private:
         globals_["copy"]=globals_["deepcopy"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_none():a[0];});
         globals_["id"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return VMVal::make_int(a.empty()?0:(int64_t)(uintptr_t)a[0].list.get());});
+            // Only checked a[0].list, so id() on anything but a LIST (a map,
+            // instance, function, string, int...) fell through to a null
+            // shared_ptr and always returned 0. Use whichever backing
+            // pointer the value actually has; primitives fall back to a
+            // stable hash so id(x) is at least non-zero and repeatable.
+            if(a.empty()) return VMVal::make_int(0);
+            VMVal& v=a[0];
+            uintptr_t raw=0;
+            switch(v.type){
+                case VMType::LIST:      raw=(uintptr_t)v.list.get(); break;
+                case VMType::MAP:
+                case VMType::INSTANCE:  raw=(uintptr_t)v.map.get();  break;
+                case VMType::FUNCTION:
+                case VMType::CLASS:     raw=(uintptr_t)v.code.get(); break;
+                case VMType::ITERATOR:  raw=(uintptr_t)v.iter.get(); break;
+                case VMType::GENERATOR: raw=(uintptr_t)v.gen.get();  break;
+                default: raw=0; break;
+            }
+            if(raw) return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
+            uint64_t h=std::hash<std::string>{}(v.to_string()+"|"+std::to_string((int)v.type));
+            return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
         globals_["hash"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_int(0);
-            return VMVal::make_int((int64_t)std::hash<std::string>{}(a[0].to_string()));});
+            uint64_t h=std::hash<std::string>{}(a[0].to_string());
+            return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
         globals_["random"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_float((double)rand()/(double)RAND_MAX);});
         globals_["randint"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             int64_t lo=a.size()>0?(a[0].type==VMType::INT?a[0].i:(int64_t)to_d(a[0])):0;
@@ -5226,6 +5622,9 @@ private:
         case Op::BINARY_LSHIFT:return "BINARY_LSHIFT";
         case Op::BINARY_RSHIFT:return "BINARY_RSHIFT";
         case Op::COMPARE_EQ:   return "COMPARE_EQ";
+        case Op::COMPARE_SEQ:  return "COMPARE_SEQ";
+        case Op::COMPARE_SNE:  return "COMPARE_SNE";
+        case Op::LOGICAL_XOR:  return "LOGICAL_XOR";
         case Op::COMPARE_NE:   return "COMPARE_NE";
         case Op::COMPARE_LT:   return "COMPARE_LT";
         case Op::COMPARE_LE:   return "COMPARE_LE";

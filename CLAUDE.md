@@ -61,13 +61,16 @@ nython/
 ├── examples/                 ← 356 example scripts
 ├── examples/gui_tests/       ← test_13 … test_27, GUI/IDE/language regressions
 ├── tests/                    ← test suites
+├── thirdparty/sdl3-stub/     ← headless SDL3/SDL3_ttf/SDL3_image stand-in;
+│                                Makefile uses it automatically when no real
+│                                SDL3 is found (see "Development environment")
 ├── HANDOFF.md                ← START HERE when resuming
 ├── FIXES_v0.2.1.md           ← round-by-round log: every bug and why
 ├── GC_NOTES.md               ← the container leak: diagnosis and three fixes
 ├── MEMORY_NOTES.md           ← writing Nython the runtime can afford
 ├── IDE_FILES.md              ← which IDE file is real (this has bitten before)
 ├── nython.cbp                ← Code::Blocks project (SDL3 pre-configured)
-├── Makefile                  ← Linux build (SDL3 always required)
+├── Makefile                  ← Linux build (real SDL3 or the headless stub)
 ├── SDL3_SETUP.md             ← Step-by-step SDL3 setup guide
 └── CLAUDE.md                 ← this file
 ```
@@ -81,10 +84,15 @@ make            # Build IDE binary (SDL3 required)
 ./build/nython-cli --ide   # Launch IDE
 ```
 
-SDL3 is always required. Install dependencies:
+Real SDL3 is used when found (`sdl3-config`/`pkg-config`, or the usual header
+paths); otherwise the Makefile falls back automatically to the headless stub
+under `thirdparty/sdl3-stub/` (see "Development environment" below) — no
+manual step needed either way. Install real SDL3 with:
 ```bash
 apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev
 ```
+Force one or the other with `NYTHON_SDL_STUB=1` (stub) / `=0` (real, fails
+loudly if not found) if auto-detection picks the wrong one.
 
 ### Windows (Code::Blocks)
 - `.cbp` is pre-configured with SDL3 include/lib paths to `C:\SDL3\`
@@ -94,14 +102,15 @@ apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev
 
 ### Development environment (no SDL3 available)
 
-The dev container has no SDL3 and cannot install it. A headless stub in
-`/home/claude/work/stub/` provides the 111 SDL symbols the project uses, so
-everything builds and every GUI/IDE test runs without a display.
+Most dev/CI containers have no SDL3 and can't install it. The headless stub
+committed at `thirdparty/sdl3-stub/` provides the SDL/SDL_ttf/SDL_image
+surface `src/builtins/gui.cpp` actually calls, so everything builds and every
+GUI/IDE test runs without a display — the Makefile picks it automatically.
 
 ```bash
-rm -rf /tmp/vbuild && /tmp/vbuild.sh     # ~5 minutes
-cp /tmp/vbuild/nython ./ny_test
-NY_STUB_AUTOQUIT=120 ./ny_test nython_ide.ny    # IDE runs and exits cleanly
+rm -rf build && make cli && make        # ~2-3 minutes total
+cp build/nython-cli ./ny_test
+NY_STUB_AUTOQUIT=120 ./build/nython --ide    # IDE runs and exits cleanly
 ```
 
 `NY_STUB_AUTOQUIT=<n>` makes the stub deliver one quit event after *n* empty
@@ -253,6 +262,29 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - ~~32-bit integer overflow~~ — results were computed at full width and then
   truncated by a cast to `(int)`. `100000 * 100000` is now correct.
 - `**` no longer demotes exact integers to double below 2^63.
+- ~~EOF errors report `stdin:1:1`~~ — the lexer's `End` token always carried the
+  right position; the parser just discarded it once it read past the last real
+  token. Fixed in `Lexer::next()`/`curr()` (HANDOFF 5.6, closed).
+- ~~`id()`/`hash()` as global functions~~ — registered as recognised builtins but
+  never actually dispatched on either engine (`id(x)` read `undefined`/`0`
+  regardless of `x`). The *method* form `obj.id()` (object protocol) already
+  worked; the bare function form didn't.
+- ~~VM: `//=` `**=` `&=` `|=` `^=` `<<=` `>>=`~~ — only `+= -= *= /= %=` were
+  wired to an opcode; the rest silently NOP'd, so e.g. `x //= 5` replaced `x`
+  with `5` (the divisor) instead of `x // 5`.
+- ~~VM: `isinstance(x, list)`~~ (the bare builtin, not the string `"list"`) —
+  always read `false`; only `isinstance(x, "list")` worked.
+- ~~VM: `case _:`~~ — compiled as a comparison against an undefined variable
+  named `_` instead of an always-match wildcard, so it never ran.
+- ~~VM: `import nytorch_classes`~~ was a no-op — the native `tensor_*` ops
+  were registered, but the Nython-level class library (`Tensor`, …) was never
+  actually loaded, unlike on the interpreter.
+- ~~VM: typed `except` / `try`/`else`~~ — only the first `except` clause was
+  ever compiled, regardless of its declared type; `else` wasn't compiled at
+  all. See HANDOFF 5.9.
+- ~~VM: `int(s)` never raised~~ — `int("abc")` silently returned `0` instead
+  of a catchable `ValueError`, and the base argument / `0x`/`0b`/`0o` prefix
+  auto-detection were never implemented.
 
 ### Added
 
@@ -262,9 +294,9 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 | `is` / `is not` | membership: `1 is int`, `1 is Object`, `c is Base` (walks the chain) |
 | `import X as Y` | binds a namespace; `from "m" import n` also works |
 | `catch` | alias for `except`, matching the existing `throw`/`raise` alias |
-| Located errors | `file:line:column`, source line, caret — both engines.<br>Mid-file only: an error at EOF still reports `stdin:1:1` (see HANDOFF 5.6). |
+| Located errors | `file:line:column`, source line, caret — both engines, including EOF. |
 | `NameError` / `ImportError` | undefined calls and missing modules were silent |
-| Object protocol | `class_name`, `to_string`, `is_a`, `fields`, … (**interpreter only**) |
+| Object protocol | `class_name`, `to_string`, `id`, `hash`, `is_a`, `instance_of`, `equals_to`, `fields`, … — both engines |
 | `--profile` | real per-function counts and self/total time |
 | `gui_hash_id` | native FNV-1a for immediate-mode widget identity |
 | `gui_display_scale` | HiDPI content scale |
@@ -273,21 +305,27 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 
 - **Containers are never reclaimed by the interpreter** — see `GC_NOTES.md`.
   The VM does not have this problem (it uses `shared_ptr`).
-- The object protocol is implemented on the interpreter only; the VM has no
-  equivalent and `test_25` skips there.
 - `len()` counts characters but `s[i]` / `s[a:b]` index bytes.
 - `1.+(2, 3)` parses but evaluates to `none` — primitives have no members.
-- Integer `/` differs between engines (`5.0` vs `5`) — a design decision, not a
-  bug; `examples/arith_test.ny` asserts the VM's answer.
+- ~~Integer `/` differs between engines~~ — **resolved (round 71)**: `/` is
+  always true division (float), `//`/`\` are floor division (int) on both
+  engines. See "Round 71 fixes" below.
 - `generator.send()` not implemented (eager-collection architecture).
 - Video builtins are stubs (need ffmpeg).
+- `@property` as decorator syntax on a class method doesn't work on the VM
+  (the explicit `x = property(getter)` form does) — see HANDOFF 5.9.
+  Interpreter-only-correct, not yet ported.
 
 ## Session Workflow
 
 1. **Read `HANDOFF.md`** — environment, traps, outstanding work.
-2. Build (`rm -rf /tmp/vbuild && /tmp/vbuild.sh`), copy to `./ny_test`.
+2. Build (`rm -rf build && make cli && make`), copy the CLI binary to
+   `./ny_test` (some GUI tests shell out to it — see HANDOFF §2). No SDL3
+   install needed; `thirdparty/sdl3-stub/` is used automatically when no real
+   SDL3 is found.
 3. Run the full sweep on **both engines** before changing anything, so any
-   failure afterwards is attributable.
+   failure afterwards is attributable. Grep the *output* for `N failed`, not
+   just the exit code — see HANDOFF §2/§3.
 4. Reproduce a defect minimally, trace it to source, fix **both engines
    together**, and add a test asserting values rather than termination.
 5. Re-run the sweep and compare divergence *sets* against
@@ -337,6 +375,143 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - **`enumerate(lst, start=N)` kwarg form fixed**: Root cause was two-part —
   (1) `NythonExecutor.hpp` kw_builtins set didn't include `"enumerate"`, so `start=` was silently dropped before reaching callBuiltin; (2) a duplicate `globals_["enumerate"]` in VirtualMachine.hpp (line ~4346) overwrote the correct version that had start-support. Both fixed: `enumerate` added to kw_builtins with `start` key extraction; both VM enumerate definitions updated with full positional + kwarg start support.
 - **vm_audit27 added**: 84 tests covering the above plus *args/**kwargs, try/else, string .replace()/.count()/.join(), isinstance with inheritance, __repr__, callable classes (__call__), dict.items()/keys()/values(), chained comparisons, lambda multi-arg, map+filter, method chaining, sorted key=/reverse=, recursion, string %, dict.get(), `in` operator.
+
+## Round 71 fixes (see `HANDOFF.md` §0b for full detail)
+
+**Division, ruled**: `/` is always true division (float — `10 / 2 == 5.0`);
+`//` and `\` are floor division (int — `10 // 2 == 10 \ 2 == 5`). This
+resolves the "Integer `/` differs between engines" known limitation above —
+it's no longer a divergence, the VM's `op_div()` was wrong and is fixed.
+
+**Dead operators, now wired up on both engines** (verified with
+`examples/vm_audit35.ny`, diffed interpreter-vs-VM):
+- `instanceof` — alias for `is`.
+- `===` / `!==` — strict equality/inequality (previously corrupted the VM
+  stack as an unhandled NOP).
+- `xor` / `^^` — logical xor (same previous VM stack corruption).
+- `>>>=` — treated as `>>=` (Nython ints are arbitrary-width, no fixed sign
+  bit to distinguish logical vs arithmetic shift).
+- `~=` — bitwise-complement-assign: `x ~= y` means `x = ~y`.
+- `++` / `--` postfix — now actually mutate on the VM (were a no-op there).
+- `\` (RevDiv) — was unreachable at the lexer level; now floor-divides.
+
+**New language constructs**:
+- `enum Name: A, B, C` — members are ordinals (or explicit values); compiles
+  to a bound name→value map on both engines.
+- `namespace Name: ...` / `module Name: ...` (module is a pure alias) — now
+  binds its own name on the interpreter (`ns.member` used to read `none`);
+  now compiles on the VM at all (used to be a silently-dropped subtree).
+- `interface Name: ...` + `class C implements Name` — interface now
+  registers as a real type on both engines, so `implements` + `is`/
+  `isinstance` chain-walking sees it (interpreter used to no-op interface
+  declarations entirely; VM used to drop the subtree).
+- `struct Point: x, y=0` — desugars at parse time to a class with a
+  synthesized `__init__` that assigns each field via `self.field = field`.
+- `new A()` / `new A` — construct an instance, distinct from `A` (the class
+  value) and `A()` (call with no `new`, equivalent to `new A()` for a
+  zero-arg constructor).
+
+**Also fixed**: hex/octal/binary integer literals (`0xFF`/`0o17`/`0b1010`)
+always evaluated to `0` on the VM (`std::stoll` stopping at the prefix
+letter) — found incidentally, not part of the operator/keyword work above.
+
+## Round 71b: IDE terminal command line
+
+`nython_ide.ny`'s terminal panel now runs real commands instead of a
+four-word stub. `lib/ide_commands.ny` (`:cmd` / `>expr` / `@agent`) and
+`lib/ide_toolchain.ny` (the real popen-based compile/run bridge) are wired
+into `NythonIDE.__init__`/`_term_run`. See `HANDOFF.md` §5.3 for the full
+command list and what is still unverified (no headless keyboard injection
+to exercise it end-to-end).
+
+## Round 71c: operation-based undo and multi-cursor editing
+
+Two more `HANDOFF.md` §5.3 modules wired into the shipped IDE:
+
+- **`EditorBuffer` (`ide_editor.ny`) undo is now operation-based**, not a
+  whole-document snapshot per keystroke. `insert_char`/`delete_char_back`/
+  `insert_newline` record a handful of scalars and replay them through
+  `_apply_inverse` (the same pop-apply-push technique `lib/gui_piecetable.
+  ny`'s `PieceTable` demonstrates), instead of `nython_ide.ny` copying
+  `buf.get_all_text()` before every character. Undo is now per-tab; `_redo()`
+  (previously a hardcoded stub) actually works, bound to Ctrl+Y / Ctrl+Shift+Z.
+- **Real multi-cursor editing** via `lib/ide_selection.ny`'s `SelectionModel`:
+  Alt+Click / Ctrl+Alt+Down / Ctrl+Alt+Up add extra carets; typing/backspace/
+  enter apply to all of them. The existing single-selection code is untouched.
+
+See `HANDOFF.md` §5.3 for the full design rationale (why a full `PieceTable`
+storage swap was rejected in favor of adopting its technique instead) and
+documented limitations (multi-caret edits aren't one undo step; arrow keys
+move only the primary caret).
+
+## Round 72: nytorch gets real autograd, and a genuine VM closure bug
+
+`lib/nytorch/autograd.ny` is new — a `Variable` class implementing actual
+reverse-mode automatic differentiation (dynamic computation graph +
+`.backward()` via reverse topological sort), scoped to scalars and 1D
+tensors. Nothing in nytorch had this before; every optimizer in
+`optimizers.ny` takes `grads` as an argument the caller must already have
+computed by hand. `LinearVar` + `mse_loss` + `SGDVar` show it end to end —
+`examples/vm_audit38.ny` trains one for 50 SGD steps and asserts the loss
+collapses to `0.0`, verified against hand-derived AND numerical
+(finite-difference) gradients on both engines.
+
+Building it found two real bugs:
+- **VM**: a closure stored in an instance attribute and invoked as
+  `obj.attr()` (exactly the shape `out._backward_fn = _bw; ...;
+  node._backward_fn()` uses) silently lost every captured variable —
+  `vm_call_method`'s "bare FUNCTION held in an attribute" path called
+  `exec_code(held.code, args, obj)` without `held.closure_env`, unlike every
+  other call path. The interpreter never had this bug.
+- **`activations.ny`**: `Tensor.relu()`/`.sigmoid()`/`.gelu()`/`.silu()`/
+  `.swish()`/`.elu()`/`.softmax()` each call a bare global function of the
+  *same name* as the method — which resolves back to the method itself, not
+  the builtin (the interpreter's own `RecursionError` message names this
+  exact gotcha). All seven were silently wrong on both engines; only
+  `Tensor.tanh()` had already dodged it via its builtin's other name,
+  `tanh_fn`.
+
+Same round, follow-up: `LinearLayerVar`/`MLPVar`/`softmax_cross_entropy`/
+`AdamVar` extend the engine to real multi-layer networks — `select()`/
+`stack_vars()` stand in for a weight matrix nytorch doesn't have (n
+independent `LinearVar` units combined into one vector), and
+`examples/vm_audit39.ny` trains one on XOR (unsolvable by a single linear
+layer) to loss 0.00046, byte-identical on both engines. See `HANDOFF.md`
+§0c for full detail, including the init fix this needed and how it was
+confirmed not to be a gradient bug first.
+
+Also new: `lib/nytorch/agent_learn.ny`'s `CodingAgent` — an online-learning
+agent built on the same autograd engine. Tokenises real Nython source with
+the real keyword vocabulary, trains a small next-token-category model one
+gradient step per adjacent pair (genuine online learning, not a deferred
+batch retrain), and its perplexity on code it was never trained on
+measurably improves after training on *different* code — real structural
+generalisation, verified in `examples/vm_audit40.ny`. Building it surfaced
+a real, quantified finding: `KnowledgeBase` is independently and
+incompatibly defined **three times** inside `nytorch/` alone (plus a
+fourth in `lib/aiagent.ny`) — import order silently picks whichever was
+defined last, and a caller written against a different one gets `none`
+back from every call instead of an error. Ten class names collide this way
+across `nytorch/`. See `HANDOFF.md` §5.10 for the full list — not fixed
+here, `agent_learn.ny` just doesn't add to it (`AgentKnowledge`, not
+`KnowledgeBase`).
+
+Final follow-up: real 2D matrix support. `Variable` gained optional
+`rows`/`cols` shape metadata over its existing flat `.data`, and
+`matmul`/`add_bias_row`/`select_row` are real batched matrix ops with
+hand-verified backward rules — `LinearMatVar`/`MLPMatVar` are the
+real-weight-matrix counterparts to `LinearLayerVar`/`MLPVar`, closing the
+"real ND tensors... absent" gap as a pure Nython addition rather than a
+native `tensor.cpp` change (too risky given ~15,000 existing lines depend
+on the current representation). `examples/vm_audit41.ny` trains
+`MLPMatVar([2,6,2])` on XOR with the whole batch going through each layer
+as one matmul call, not four separate forward passes. Along the way, a
+numerical-gradient-check false alarm (0.16 diff, traced to XOR's `(0,0)`
+point landing exactly on relu's non-differentiable point at zero, given
+zero-initialized bias) turned out not to be a bug — confirmed by printing
+the pre-activations and by re-checking with inputs that avoid that one
+coincidental point, which alone resolved it. See `HANDOFF.md` §0c for
+the full trace.
 
 ## Transcripts
 

@@ -16,6 +16,8 @@
 # Order matters: activations.ny defines Tensor, which the rest build on.
 
 import "lib/nytorch/activations.ny"
+import "lib/nytorch/autograd.ny"
+import "lib/nytorch/agent_learn.ny"
 import "lib/nytorch/compute.ny"
 import "lib/nytorch/layers.ny"
 import "lib/nytorch/losses.ny"

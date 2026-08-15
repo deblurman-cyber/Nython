@@ -19,6 +19,9 @@ import "ide_project.ny"
 import "lib/aiagent.ny"
 import "lib/gui_motion.ny"
 import "lib/nyimgui.ny"
+import "lib/ide_toolchain.ny"
+import "lib/ide_commands.ny"
+import "lib/ide_selection.ny"
 
 
 class IDETheme:
@@ -271,9 +274,11 @@ class NythonIDE:
         self.problem_count = 3
         self.problem_rows = []
 
-        self.term_lines = ["Nython 0.2.1 interactive shell", "type 'help' for commands", ""]
+        self.toolchain = Toolchain()
+        self.term_lines = ["Nython 0.2.1 interactive shell", "type ':help' (IDE), '>expr' (language) or '@agents' (AI)", ""]
         self.term_count = 3
         self.term_input = ""
+        self.term_hist_stash = ""
 
         self.tree = [{"depth": 0, "name": "project",   "dir": true,  "open": true},
                      {"depth": 1, "name": "src",       "dir": true,  "open": true},
@@ -356,6 +361,8 @@ class NythonIDE:
         self.ai_issues = []
         self.ai_n = 0
         self.ai_file = ""
+        # Terminal command line: :cmd / >expr / @agent, see lib/ide_commands.ny.
+        self.cmdline = CommandLine(self.toolchain, self.ai)
         # Workspace search
         self.search_query = ""
         self.search_hits = []
@@ -366,8 +373,6 @@ class NythonIDE:
         self.caret_on = true
         self.caret_t = 0
         self.clipboard = ""
-        self.undo_stack = []
-        self.undo_n = 0
         self.debug_line = -1
         self.status_segs = []
         self.status_hover = -1
@@ -399,6 +404,11 @@ class NythonIDE:
         self.sel_row = 0
         self.sel_col = 0
         self.dragging_sel = false
+        # Multi-cursor (lib/ide_selection.ny). The primary caret stays
+        # buf.cursor_row/cursor_col exactly as before; selmodel.sels[0] is
+        # only a dedup mirror kept in sync right before use, and
+        # selmodel.sels[1:selmodel.count] are the actual extra carets.
+        self.selmodel = SelectionModel()
         self.outline = []
         self.outline_n = 0
         self.outline_sel = -1
@@ -960,6 +970,25 @@ class NythonIDE:
             var cm = self.f_code.width(upto)
             if self.caret_on:
                 r.fill_xywh(text_x + cm, cy + 1, 2, line_h - 2, th.accent)
+
+        # Extra carets (multi-cursor, lib/ide_selection.ny). Same blink
+        # phase as the primary; a lighter tint keeps the primary caret
+        # visually distinct from the others.
+        if self.selmodel.count > 1 and self.caret_on:
+            var ei = 1
+            while ei < self.selmodel.count:
+                var s = self.selmodel.sels[ei]
+                var erow = s.caret.row - top
+                if erow >= 0 and erow < rows and s.caret.row < buf.line_count:
+                    var ecol = s.caret.col
+                    var ell = len(buf.get_line(s.caret.row))
+                    if ecol > ell:
+                        ecol = ell
+                    var ey = self.ed_y + erow * line_h
+                    var eupto = string_slice(buf.get_line(s.caret.row), 0, ecol)
+                    var ecm = self.f_code.width(eupto)
+                    r.fill_xywh(text_x + ecm, ey + 1, 2, line_h - 2, Color(255, 255, 255, 200))
+                ei = ei + 1
         r.clear_clip()
         r.draw_line(self.col_x + self.GUTTER_W, self.ed_y, self.col_x + self.GUTTER_W, self.ed_y + self.ed_h, th.border_soft, 1)
 
@@ -1375,11 +1404,25 @@ class NythonIDE:
                 if e.key == "enter":
                     self.term_lines.append("$ " + self.term_input)
                     self.term_count = self.term_count + 1
-                    var out = self._term_run(self.term_input)
-                    if out != "":
-                        self.term_lines.append(out)
-                        self.term_count = self.term_count + 1
+                    self._term_run(self.term_input)
                     self.term_input = ""
+                    e.consume()
+                    return
+                if e.key == "up":
+                    self.term_input = self.cmdline.history_prev()
+                    e.consume()
+                    return
+                if e.key == "down":
+                    self.term_input = self.cmdline.history_next()
+                    e.consume()
+                    return
+                if e.key == "tab":
+                    var comp = self.cmdline.complete(self.term_input)
+                    if len(comp) == 1:
+                        self.term_input = comp[0]
+                    elif len(comp) > 1:
+                        self.term_lines.append(string_join(comp, "  "))
+                        self.term_count = self.term_count + 1
                     e.consume()
                     return
 
@@ -1395,16 +1438,18 @@ class NythonIDE:
                     else:
                         self._sel_clear()
                 if e.type == "textinput" or e.key == "backspace" or e.key == "enter":
-                    # Typing over a selection replaces it.
+                    # Typing over a selection replaces it. A plain edit needs
+                    # no push here: EditorBuffer.insert_char/delete_char_back/
+                    # insert_newline record their own undo entry.
                     if self._sel_range() != none:
                         self._sel_delete()
                         if e.key == "backspace":
                             e.consume()
-                    else:
-                        self._push_undo()
                 if e.consumed:
                     return
                 self.editor.handle_event(e)
+                if e.type == "textinput" or e.key == "backspace" or e.key == "enter":
+                    self._apply_to_extra_carets(e)
                 # No auto-indent here: EditorBuffer.newline() already copies the
                 # previous line's indentation and adds a level after ':'. Doing
                 # it again indented new lines twice.
@@ -1698,6 +1743,12 @@ class NythonIDE:
                     return
             var p = self._pos_at(x, y)
             var buf = self.buffers[self.active_tab]
+            if e.alt:
+                self._add_caret(p["row"], p["col"])
+                self.editor.focused = true
+                e.consume()
+                return
+            self._clear_extra_carets()
             buf.cursor_row = p["row"]
             buf.cursor_col = p["col"]
             if e.shift:
@@ -1728,6 +1779,10 @@ class NythonIDE:
         if e.key == "escape":
             if self.menu_open >= 0:
                 self.menu_open = -1
+                e.consume()
+                return true
+            if self.selmodel.count > 1:
+                self._clear_extra_carets()
                 e.consume()
                 return true
         if e.key == "k" and e.ctrl and not e.shift:
@@ -1775,6 +1830,14 @@ class NythonIDE:
             self._delete_line()
             e.consume()
             return true
+        if e.key == "up" and e.alt and e.ctrl:
+            self._add_caret_vertical(0 - 1)
+            e.consume()
+            return true
+        if e.key == "down" and e.alt and e.ctrl:
+            self._add_caret_vertical(1)
+            e.consume()
+            return true
         if e.key == "up" and e.alt:
             self._move_line(0 - 1)
             e.consume()
@@ -1794,8 +1857,16 @@ class NythonIDE:
             self.status_msg = "Saved " + os_path_basename(sp)
             e.consume()
             return true
+        if e.key == "z" and e.ctrl and e.shift:
+            self._redo()
+            e.consume()
+            return true
         if e.key == "z" and e.ctrl:
             self._undo()
+            e.consume()
+            return true
+        if e.key == "y" and e.ctrl:
+            self._redo()
             e.consume()
             return true
         if e.key == "c" and e.ctrl:
@@ -2482,7 +2553,7 @@ class NythonIDE:
         self.tabs[self.active_tab].dirty = true
 
     def _toggle_comment(self):
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var sp = self._line_span()
         # If every non-blank line in the range is already commented, uncomment;
@@ -2516,7 +2587,7 @@ class NythonIDE:
         self.status_msg = "Toggled comment"
 
     def _duplicate_line(self):
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var row = buf.cursor_row
         var out = []
@@ -2533,7 +2604,7 @@ class NythonIDE:
         self.status_msg = "Duplicated line"
 
     def _delete_line(self):
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         if buf.line_count <= 1:
             buf.lines = [""]
@@ -2563,7 +2634,7 @@ class NythonIDE:
         var dest = row + delta
         if dest < 0 or dest >= buf.line_count:
             return
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var tmp = buf.lines[row]
         buf.lines[row] = buf.lines[dest]
         buf.lines[dest] = tmp
@@ -2628,7 +2699,7 @@ class NythonIDE:
         var g = self._sel_range()
         if g == none:
             return false
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var head = string_slice(buf.get_line(g["r1"]), 0, g["c1"])
         var tail = string_slice(buf.get_line(g["r2"]), g["c2"], len(buf.get_line(g["r2"])))
@@ -2651,6 +2722,112 @@ class NythonIDE:
         self._hl_cache_n = 0
         self.tabs[self.active_tab].dirty = true
         return true
+
+    # ══ multi-cursor ═════════════════════════════════════════════════════════
+    # Extra carets beyond the primary (buf.cursor_row/cursor_col, unchanged).
+    # Deliberately position-only, with no selection of their own — Alt+Click
+    # and Ctrl+Alt+Up/Down are the two ways real editors most commonly grow a
+    # multi-cursor set, and both only ever need a point, not a range.
+    def _sync_primary_caret(self):
+        var buf = self.buffers[self.active_tab]
+        self.selmodel.sels[0].caret.row = buf.cursor_row
+        self.selmodel.sels[0].caret.col = buf.cursor_col
+
+    def _add_caret(self, row, col):
+        self._sync_primary_caret()
+        var added = self.selmodel.add_caret(row, col)
+        if added:
+            self._dirty = true
+        return added
+
+    def _add_caret_vertical(self, delta):
+        var buf = self.buffers[self.active_tab]
+        self._sync_primary_caret()
+        # Extends from the last-added caret, not always the primary, so
+        # repeated presses walk further in the same direction.
+        var from_row = buf.cursor_row
+        var from_col = buf.cursor_col
+        if self.selmodel.count > 1:
+            var last = self.selmodel.sels[self.selmodel.count - 1]
+            from_row = last.caret.row
+            from_col = last.caret.col
+        var nrow = from_row + delta
+        if nrow < 0 or nrow >= buf.line_count:
+            return false
+        var ncol = from_col
+        var ll = len(buf.get_line(nrow))
+        if ncol > ll:
+            ncol = ll
+        var added = self.selmodel.add_caret(nrow, ncol)
+        if added:
+            self._dirty = true
+        return added
+
+    def _clear_extra_carets(self):
+        if self.selmodel.count > 1:
+            self.selmodel.clear_secondary()
+            self._dirty = true
+
+    # Replays the edit e just applied to the primary caret at every extra
+    # caret. Processed from the last caret to the first (by row, then col,
+    # descending): an insert or delete only shifts positions after it, so
+    # working backward keeps not-yet-processed carets' saved positions valid
+    # without having to recompute them. Bounds-checked against the CURRENT
+    # buffer rather than trusted outright, since a caret added before a tab
+    # switch would otherwise index past a shorter file's line count.
+    def _apply_to_extra_carets(self, e):
+        if self.selmodel.count <= 1:
+            return
+        var buf = self.buffers[self.active_tab]
+        var save_row = buf.cursor_row
+        var save_col = buf.cursor_col
+        var order = []
+        var i = 1
+        while i < self.selmodel.count:
+            if self.selmodel.sels[i].caret.row < buf.line_count:
+                order.append(i)
+            i = i + 1
+        var n = len(order)
+        var a = 0
+        while a < n:
+            var b = a + 1
+            while b < n:
+                var sa = self.selmodel.sels[order[a]]
+                var sb = self.selmodel.sels[order[b]]
+                var swap = false
+                if sb.caret.row > sa.caret.row:
+                    swap = true
+                elif sb.caret.row == sa.caret.row and sb.caret.col > sa.caret.col:
+                    swap = true
+                if swap:
+                    var t = order[a]
+                    order[a] = order[b]
+                    order[b] = t
+                b = b + 1
+            a = a + 1
+        var k = 0
+        while k < n:
+            var s = self.selmodel.sels[order[k]]
+            var crow = s.caret.row
+            var ccol = s.caret.col
+            var ll = len(buf.get_line(crow))
+            if ccol > ll:
+                ccol = ll
+            buf.cursor_row = crow
+            buf.cursor_col = ccol
+            if e.type == "textinput":
+                buf.insert_char(e.text)
+            elif e.key == "backspace":
+                buf.delete_char_back()
+            elif e.key == "enter":
+                buf.insert_newline()
+            s.caret.row = buf.cursor_row
+            s.caret.col = buf.cursor_col
+            s.anchor.row = buf.cursor_row
+            s.anchor.col = buf.cursor_col
+            k = k + 1
+        buf.cursor_row = save_row
+        buf.cursor_col = save_col
 
     # Pixel position -> (row, col), used by click and drag.
     def _pos_at(self, x, y):
@@ -3103,79 +3280,42 @@ class NythonIDE:
         r.draw_text(self.tooltip, x + 10, y + 6, self.f_small, th.text)
 
     # ── edit actions ─────────────────────────────────────────────────────────
-    # History is whole-file snapshots, so its cost scales with file size, not
-    # edit size: 50 steps on a 140 KB file held 7,000,000 characters in the
-    # measurement for this change — 50 copies of text that is almost entirely
-    # identical. Two bounds keep that in check without altering behaviour:
-    # identical consecutive states are not stored at all, and the stack is
-    # trimmed on total characters as well as on step count, so a large file
-    # keeps fewer steps rather than proportionally more memory.
+    # Undo/redo history now lives on each EditorBuffer itself
+    # (ide_editor.ny), one operation-log entry per edit instead of a
+    # whole-document snapshot per keystroke — see that file's _record_op/
+    # _apply_inverse, modelled on lib/gui_piecetable.ny's PieceTable. This
+    # also makes undo per-tab rather than a single history shared across
+    # every open file, which is what every other editor does and avoids the
+    # old behaviour's occasional surprise of Ctrl+Z switching tabs.
     #
-    # (The real fix is a piece table — lib/gui_piecetable.ny stores the text
-    # once and makes a history entry a list of spans, 140,050 characters for the
-    # same 50 steps. Adopting it means re-backing EditorBuffer, which every
-    # editor feature reads, so it belongs in its own change.)
-    def _push_undo(self):
-        var buf = self.buffers[self.active_tab]
-        var txt = buf.get_all_text()
-        if self.undo_n > 0:
-            var last = self.undo_stack[self.undo_n - 1]
-            if last["tab"] == self.active_tab and last["text"] == txt:
-                return 0
-        self.undo_stack = self.undo_stack + [{"tab": self.active_tab, "text": txt,
-                                              "row": buf.cursor_row, "col": buf.cursor_col}]
-        self.undo_n = self.undo_n + 1
-
-        # Character budget: ~4 MB of history regardless of document size.
-        var budget = 4000000
-        var used = 0
-        var j = self.undo_n - 1
-        var keep_from = 0
-        while j >= 0:
-            used = used + len(self.undo_stack[j]["text"])
-            if used > budget and keep_from == 0:
-                keep_from = j + 1
-            j = j - 1
-        if keep_from > 0:
-            var kept = []
-            var m = keep_from
-            while m < self.undo_n:
-                kept.append(self.undo_stack[m])
-                m = m + 1
-            self.undo_stack = kept
-            self.undo_n = len(kept)
-
-        if self.undo_n > 50:
-            var trimmed = []
-            var i = 1
-            while i < self.undo_n:
-                trimmed.append(self.undo_stack[i])
-                i = i + 1
-            self.undo_stack = trimmed
-            self.undo_n = self.undo_n - 1
-
+    # Character-level edits (typing, backspace, newline) call
+    # EditorBuffer.insert_char/delete_char_back/insert_newline directly, via
+    # self.editor.handle_event(), and record their own undo entry — nothing
+    # to do here for those. Coarser edits that reach into buf.lines directly
+    # (cut/paste a line, comment toggle, move a line, indent/dedent a range,
+    # find/replace-all) still need one snapshot per action; call
+    # self.buffers[self.active_tab].push_snapshot() immediately before them.
     def _undo(self):
-        if self.undo_n == 0:
+        var buf = self.buffers[self.active_tab]
+        if not buf.can_undo():
             self.status_msg = "Nothing to undo"
             return
-        var snap = self.undo_stack[self.undo_n - 1]
-        var keep = []
-        var i = 0
-        while i < self.undo_n - 1:
-            keep.append(self.undo_stack[i])
-            i = i + 1
-        self.undo_stack = keep
-        self.undo_n = self.undo_n - 1
-        var idx = snap["tab"]
-        if idx < self.tab_count:
-            self.buffers[idx] = EditorBuffer(self.tabs[idx].title, snap["text"])
-            self.buffers[idx].cursor_row = snap["row"]
-            self.buffers[idx].cursor_col = snap["col"]
-            self.active_tab = idx
-            self.editor.set_buffer(self.buffers[idx])
+        buf.undo()
+        self.editor.set_buffer(buf)
         self._hl_cache = {}
         self._hl_cache_n = 0
         self.status_msg = "Undo"
+
+    def _redo(self):
+        var buf = self.buffers[self.active_tab]
+        if not buf.can_redo():
+            self.status_msg = "Nothing to redo"
+            return
+        buf.redo()
+        self.editor.set_buffer(buf)
+        self._hl_cache = {}
+        self._hl_cache_n = 0
+        self.status_msg = "Redo"
 
     def _copy_line(self):
         var sel = self._sel_text()
@@ -3194,7 +3334,7 @@ class NythonIDE:
             self._sel_delete()
             self.status_msg = "Cut selection"
             return
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         self.clipboard = buf.get_line(buf.cursor_row)
         var keep = []
@@ -3218,7 +3358,7 @@ class NythonIDE:
         if self.clipboard == "":
             self.status_msg = "Clipboard is empty"
             return
-        self._push_undo()
+        self.buffers[self.active_tab].push_snapshot()
         var buf = self.buffers[self.active_tab]
         var out = []
         var i = 0
@@ -3477,6 +3617,10 @@ class NythonIDE:
         if self.find_query == "":
             return
         var buf = self.buffers[self.active_tab]
+        # Not previously undoable at all; now that undo is a per-buffer op
+        # log rather than a hand-placed snapshot call, giving replace-all one
+        # is a one-line addition instead of its own risky change.
+        buf.push_snapshot()
         var replaced = 0
         var i = 0
         while i < buf.line_count:
@@ -3597,26 +3741,150 @@ class NythonIDE:
     def _has_break(self, line):
         return self.breaks.has_key(self._break_key(line))
 
+    # Runs a line typed into the terminal through lib/ide_commands.ny's
+    # CommandLine: ":cmd" drives the IDE, ">expr"/bare input is real language
+    # evaluation via lib/ide_toolchain.ny's Toolchain, "@agent" talks to the
+    # analyser in lib/aiagent.ny. The command line only names an action
+    # (res.action); this is where the action is actually performed, since
+    # CommandLine has no window to reach into.
     def _term_run(self, cmd):
         var c = string_strip(cmd)
         if c == "":
-            return ""
-        if c == "help":
-            return "commands: help, clear, files, version"
-        if c == "clear":
-            self.term_lines = []
-            self.term_count = 0
-            return ""
+            return
+        # A couple of one-word conveniences people type without a sigil,
+        # kept for continuity with the old ad hoc terminal.
         if c == "files":
             var out = ""
             var i = 0
             while i < self.tab_count:
                 out = out + self.tabs[i].title + "  "
                 i = i + 1
-            return out
+            self.term_lines.append(out)
+            self.term_count = self.term_count + 1
+            return
         if c == "version":
-            return "Nython 0.2.1  |  NythonIDE v4"
-        return "unknown command: " + c
+            self.term_lines.append("Nython 0.2.1  |  NythonIDE v4")
+            self.term_count = self.term_count + 1
+            return
+
+        var res = self.cmdline.execute(cmd, self)
+        var i = 0
+        while i < len(res.lines):
+            self.term_lines.append(res.lines[i])
+            self.term_count = self.term_count + 1
+            i = i + 1
+        self._term_dispatch(res.action, res.arg)
+
+    # Performs the IDE-side effect of a ":cmd" or "@agent" command. Named
+    # actions keep CommandLine itself free of any window/editor dependency.
+    def _term_dispatch(self, action, arg):
+        if action == "":
+            return
+        if action == "clear":
+            self.term_lines = []
+            self.term_count = 0
+        elif action == "run" or action == "build":
+            self._build_run("Run")
+        elif action == "vm":
+            self._build_run("VM")
+        elif action == "tokens":
+            self._build_run("Tokenize")
+        elif action == "ast":
+            self._build_run("AST")
+        elif action == "disasm":
+            self._build_run("Disasm")
+        elif action == "profile":
+            self._term_profile()
+        elif action == "save":
+            self._save_active()
+            self._toast("Saved", "ok")
+        elif action == "theme":
+            self._set_theme(not self.th.dark)
+        elif action == "quit":
+            self._save_settings()
+            self.win.running = false
+        elif action == "open":
+            if arg != "":
+                self._open_path(arg)
+            else:
+                self.term_lines.append("usage: :open <path>")
+                self.term_count = self.term_count + 1
+        elif action == "goto":
+            if arg != "":
+                self._goto_line(int(arg))
+            else:
+                self.term_lines.append("usage: :goto <line>")
+                self.term_count = self.term_count + 1
+        elif action == "find":
+            self.find_query = arg
+            self.find_open = true
+            self.find_replace_mode = false
+            self.find_field = 0
+            self._find_run()
+        elif action == "panel":
+            var pidx = -1
+            var pi = 0
+            while pi < len(self.panel_tabs):
+                if string_lower(self.panel_tabs[pi]) == string_lower(arg):
+                    pidx = pi
+                pi = pi + 1
+            if pidx >= 0:
+                self.panel_open = true
+                self.active_panel = pidx
+            else:
+                self.term_lines.append("unknown panel: " + arg)
+                self.term_count = self.term_count + 1
+        elif string_startswith(action, "agent:"):
+            self._term_agent(string_slice(action, 6, len(action)), arg)
+
+    # A run under `--profile`, top hot rows only — the IDE has no dedicated
+    # profiler panel yet, so this is the only place profiling is reachable.
+    def _term_profile(self):
+        var path = self._save_active()
+        var res = self.toolchain.profile(self.buffers[self.active_tab].get_all_text(), path)
+        if res.profile_count == 0:
+            self.term_lines.append("no profile data (did the program run to completion?)")
+            self.term_count = self.term_count + 1
+            return
+        self.term_lines.append("name                 calls   total ms   self ms")
+        self.term_count = self.term_count + 1
+        var i = 0
+        var shown = 0
+        while i < res.profile_count and shown < 15:
+            var row = res.profile_rows[i]
+            self.term_lines.append(str(row[0]) + "  " + str(row[1]) + "  " + str(row[2]) + "  " + str(row[3]))
+            self.term_count = self.term_count + 1
+            shown = shown + 1
+            i = i + 1
+
+    # @explain / @fix reuse the same pattern-based analyser the sidebar's
+    # "Analyse Buffer" action already runs (lib/aiagent.ny's CodeAnalyzer) —
+    # there is no separate LLM backend wired in, so this reports what the
+    # analyser actually finds rather than inventing a smarter answer.
+    def _term_agent(self, verb, arg):
+        if verb == "explain":
+            var text = self.buffers[self.active_tab].get_all_text()
+            self.term_lines.append(self.tabs[self.active_tab].title + ": "
+                + str(self.ai.count_lines(text)) + " lines, "
+                + str(self.ai.count_classes(text)) + " classes, "
+                + str(self.ai.count_functions(text)) + " functions")
+            self.term_count = self.term_count + 1
+            return
+        if verb == "fix":
+            self._ai_analyze(true)
+            if self.ai_n == 0:
+                self.term_lines.append("no issues found")
+                self.term_count = self.term_count + 1
+                return
+            var i = 0
+            while i < self.ai_n:
+                var it = self.ai_issues[i]
+                self.term_lines.append("line " + str(it["line"]) + ": " + it["message"])
+                self.term_count = self.term_count + 1
+                i = i + 1
+            return
+        self.term_lines.append("@" + verb + " is not wired to a live model yet — try @explain or @fix")
+        self.term_count = self.term_count + 1
 
     def _close_tab(self, idx):
         if self.tab_count <= 1:
@@ -3696,7 +3964,7 @@ class NythonIDE:
         elif label == "Undo":
             self._undo()
         elif label == "Redo":
-            self.status_msg = "Nothing to redo"
+            self._redo()
         elif label == "Cut":
             self._cut_line()
         elif label == "Copy":

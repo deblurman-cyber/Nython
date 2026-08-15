@@ -1,5 +1,30 @@
 # import nytorch
 
+# A method named identically to a global builtin it calls bare — relu,
+# sigmoid, gelu, silu, swish, elu, softmax below — resolves that bare call
+# back to itself instead of the builtin: self-recursion, which either
+# overflows the call stack directly or, crossing into tensor_apply's native
+# per-element callback, comes back as `none` for every element instead of
+# raising. tanh already dodged this by calling the builtin under its other
+# registered name, tanh_fn; these give the rest of the same treatment rather
+# than leaving Tensor.relu()/.sigmoid()/.gelu()/.silu()/.swish()/.elu()/
+# .softmax() silently wrong.
+def _relu_bi(v):
+    return relu(v)
+def _sigmoid_bi(v):
+    return sigmoid(v)
+def _gelu_bi(v):
+    return gelu(v)
+def _silu_bi(v):
+    return silu(v)
+def _swish_bi(v):
+    return swish(v)
+def _elu_bi(v):
+    return elu(v)
+def _softmax_bi(v):
+    return softmax(v)
+
+
 class Tensor:
     def init(self, data):
         if type(data) == "list":
@@ -65,21 +90,21 @@ class Tensor:
 
     # Activations    raw tensor
     def relu(self):
-        return tensor_apply(self.data, lambda v: relu(v))
+        return tensor_apply(self.data, lambda v: _relu_bi(v))
     def sigmoid(self):
-        return tensor_apply(self.data, lambda v: sigmoid(v))
+        return tensor_apply(self.data, lambda v: _sigmoid_bi(v))
     def tanh(self):
         return tensor_apply(self.data, lambda v: tanh_fn(v))
     def gelu(self):
-        return tensor_apply(self.data, lambda v: gelu(v))
+        return tensor_apply(self.data, lambda v: _gelu_bi(v))
     def silu(self):
-        return tensor_apply(self.data, lambda v: silu(v))
+        return tensor_apply(self.data, lambda v: _silu_bi(v))
     def swish(self):
-        return tensor_apply(self.data, lambda v: swish(v))
+        return tensor_apply(self.data, lambda v: _swish_bi(v))
     def elu(self):
-        return tensor_apply(self.data, lambda v: elu(v))
+        return tensor_apply(self.data, lambda v: _elu_bi(v))
     def softmax(self):
-        return softmax(self.data)
+        return _softmax_bi(self.data)
     def mish(self):
         return tensor_apply(self.data, lambda v: v * tanh_fn(log(1.0 + 2.71828182845904 ** v)))
     def hardsigmoid(self):
