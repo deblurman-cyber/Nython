@@ -101,6 +101,13 @@ class Variable:
         self._children = []
         self._backward_fn = none
         self._op = "leaf"
+        # Optional logical shape for 2D use (matmul/add_bias_row below).
+        # .data stays the same flat row-major list either way — nytorch has
+        # no native ND tensor type (CLAUDE.md's "real ND tensors... absent"
+        # gap), so this is bookkeeping on top of the existing flat
+        # representation, not a new storage type. 0 means "not a matrix."
+        self.rows = 0
+        self.cols = 0
 
     def _accum(self, g):
         if not self.requires_grad:
@@ -112,6 +119,26 @@ class Variable:
 
     def zero_grad(self):
         self.grad = none
+
+    # Shape propagation for elementwise ops: the output has the same
+    # logical shape as its operand(s), since none of add/sub/mul/scale/
+    # relu/sigmoid/tanh/exp/log/pow change how many rows or columns there
+    # are, only the values. matmul/add_bias_row set rows/cols explicitly
+    # instead, since those DO change shape.
+    def _inherit_shape(self, src):
+        self.rows = src.rows
+        self.cols = src.cols
+
+    def _inherit_shape2(self, a, b):
+        if a.rows > 0:
+            self.rows = a.rows
+            self.cols = a.cols
+        else:
+            self.rows = b.rows
+            self.cols = b.cols
+
+    def is_matrix(self):
+        return self.rows > 0 and self.cols > 0
 
     def detach(self):
         return Variable(self.data, false)
@@ -160,6 +187,7 @@ class Variable:
     # ── binary ops ───────────────────────────────────────────────────────────
     def add(self, other):
         var out = Variable(_add_raw(self.data, other.data), self.requires_grad or other.requires_grad)
+        out._inherit_shape2(self, other)
         out._children = [self, other]
         out._op = "add"
         var a = self
@@ -172,6 +200,7 @@ class Variable:
 
     def sub(self, other):
         var out = Variable(_sub_raw(self.data, other.data), self.requires_grad or other.requires_grad)
+        out._inherit_shape2(self, other)
         out._children = [self, other]
         out._op = "sub"
         var a = self
@@ -185,6 +214,7 @@ class Variable:
     # Elementwise (or scalar*scalar) multiply. d(a*b)/da = b, d(a*b)/db = a.
     def mul(self, other):
         var out = Variable(_mul_raw(self.data, other.data), self.requires_grad or other.requires_grad)
+        out._inherit_shape2(self, other)
         out._children = [self, other]
         out._op = "mul"
         var a = self
@@ -208,6 +238,111 @@ class Variable:
         out._backward_fn = _bw
         return out
 
+    # Real matrix multiply: self is (m x k), other is (k x n), both flat
+    # row-major with rows/cols set (see LinearMatVar below for how those
+    # get set). Unlike LinearLayerVar's N-independent-scalar-units
+    # workaround, this is one actual batched matmul — self can be a whole
+    # batch of samples (rows = batch size) multiplied through in one call,
+    # not one forward pass per sample. Standard backward rule:
+    # dA = dC @ B^T, dB = A^T @ dC.
+    def matmul(self, other):
+        var m = self.rows
+        var k = self.cols
+        var n = other.cols
+        var out_data = []
+        var i = 0
+        while i < m:
+            var j = 0
+            while j < n:
+                var s = 0.0
+                var p = 0
+                while p < k:
+                    s = s + self.data[i * k + p] * other.data[p * n + j]
+                    p = p + 1
+                out_data.append(s)
+                j = j + 1
+            i = i + 1
+        var out = Variable(tensor(out_data), self.requires_grad or other.requires_grad)
+        out.rows = m
+        out.cols = n
+        out._children = [self, other]
+        out._op = "matmul"
+        var a = self
+        var b = other
+        var mc = m
+        var kc = k
+        var nc = n
+        def _bw():
+            var dA = zeros(mc * kc)
+            var i2 = 0
+            while i2 < mc:
+                var p2 = 0
+                while p2 < kc:
+                    var s2 = 0.0
+                    var j2 = 0
+                    while j2 < nc:
+                        s2 = s2 + out.grad[i2 * nc + j2] * b.data[p2 * nc + j2]
+                        j2 = j2 + 1
+                    dA[i2 * kc + p2] = s2
+                    p2 = p2 + 1
+                i2 = i2 + 1
+            var dB = zeros(kc * nc)
+            var p3 = 0
+            while p3 < kc:
+                var j3 = 0
+                while j3 < nc:
+                    var s3 = 0.0
+                    var i3 = 0
+                    while i3 < mc:
+                        s3 = s3 + a.data[i3 * kc + p3] * out.grad[i3 * nc + j3]
+                        i3 = i3 + 1
+                    dB[p3 * nc + j3] = s3
+                    j3 = j3 + 1
+                p3 = p3 + 1
+            a._accum(dA)
+            b._accum(dB)
+        out._backward_fn = _bw
+        return out
+
+    # Broadcasting add of a 1D bias vector across every row of a 2D
+    # Variable — the other half of a real nn.Linear, alongside matmul.
+    # d(out)/d(self) is identity (same shape); d(out)/d(bias) sums the
+    # upstream gradient down each column, the standard broadcast-backward
+    # rule (every row's copy of bias contributed to that column's output).
+    def add_bias_row(self, bias):
+        var r = self.rows
+        var c = self.cols
+        var out_data = []
+        var i = 0
+        while i < r:
+            var j = 0
+            while j < c:
+                out_data.append(self.data[i * c + j] + bias.data[j])
+                j = j + 1
+            i = i + 1
+        var out = Variable(tensor(out_data), self.requires_grad or bias.requires_grad)
+        out.rows = r
+        out.cols = c
+        out._children = [self, bias]
+        out._op = "add_bias_row"
+        var a = self
+        var b = bias
+        var rc = r
+        var cc = c
+        def _bw():
+            a._accum(out.grad)
+            var db = zeros(cc)
+            var i2 = 0
+            while i2 < rc:
+                var j2 = 0
+                while j2 < cc:
+                    db[j2] = db[j2] + out.grad[i2 * cc + j2]
+                    j2 = j2 + 1
+                i2 = i2 + 1
+            b._accum(db)
+        out._backward_fn = _bw
+        return out
+
     # Pick out one element of a vector Variable as its own scalar Variable.
     # The inverse of stack_vars() below — gradient flows back to only the
     # selected index, everywhere else in self.grad gets 0 from this op.
@@ -221,6 +356,36 @@ class Variable:
         def _bw():
             var g = zeros(n)
             g[idx] = out.grad
+            a._accum(g)
+        out._backward_fn = _bw
+        return out
+
+    # Pick out row i of a 2D (rows x cols) Variable as its own 1D vector
+    # Variable — how a batched forward pass (one matmul for the whole
+    # batch) still lets each sample get its own loss: run the batch through
+    # the network ONCE, then select_row() each sample's output before
+    # softmax_cross_entropy, and one shared backward() through all of it
+    # accumulates every sample's contribution into the same weight matrix.
+    def select_row(self, i):
+        var c = self.cols
+        var row_data = []
+        var j = 0
+        while j < c:
+            row_data.append(self.data[i * c + j])
+            j = j + 1
+        var out = Variable(tensor(row_data), self.requires_grad)
+        out._children = [self]
+        out._op = "select_row"
+        var a = self
+        var ri = i
+        var cc = c
+        var total_rows = self.rows
+        def _bw():
+            var g = zeros(total_rows * cc)
+            var j2 = 0
+            while j2 < cc:
+                g[ri * cc + j2] = out.grad[j2]
+                j2 = j2 + 1
             a._accum(g)
         out._backward_fn = _bw
         return out
@@ -239,6 +404,7 @@ class Variable:
     # is never itself part of the graph.
     def scale(self, k):
         var out = Variable(_scale_raw(self.data, k), self.requires_grad)
+        out._inherit_shape(self)
         out._children = [self]
         out._op = "scale"
         var a = self
@@ -252,6 +418,7 @@ class Variable:
     def pow(self, p):
         var out = Variable(tensor_pow(self.data, p) if _is_vec(self.data) else self.data ** p,
                             self.requires_grad)
+        out._inherit_shape(self)
         out._children = [self]
         out._op = "pow"
         var a = self
@@ -266,6 +433,7 @@ class Variable:
     def exp(self):
         var out = Variable(tensor_exp(self.data) if _is_vec(self.data) else _exp_bi(self.data),
                             self.requires_grad)
+        out._inherit_shape(self)
         out._children = [self]
         out._op = "exp"
         var a = self
@@ -278,6 +446,7 @@ class Variable:
     def log(self):
         var out = Variable(tensor_log(self.data) if _is_vec(self.data) else _log_bi(self.data),
                             self.requires_grad)
+        out._inherit_shape(self)
         out._children = [self]
         out._op = "log"
         var a = self
@@ -323,6 +492,7 @@ class Variable:
         var out = Variable(tensor_apply(self.data, lambda v: _relu_bi(v)) if _is_vec(self.data)
                             else _relu_bi(self.data),
                             self.requires_grad)
+        out._inherit_shape(self)
         out._children = [self]
         out._op = "relu"
         var a = self
@@ -340,6 +510,7 @@ class Variable:
         var out = Variable(tensor_apply(self.data, lambda v: _sigmoid_bi(v)) if _is_vec(self.data)
                             else _sigmoid_bi(self.data),
                             self.requires_grad)
+        out._inherit_shape(self)
         out._children = [self]
         out._op = "sigmoid"
         var a = self
@@ -357,6 +528,7 @@ class Variable:
         var out = Variable(tensor_apply(self.data, lambda v: tanh_fn(v)) if _is_vec(self.data)
                             else tanh_fn(self.data),
                             self.requires_grad)
+        out._inherit_shape(self)
         out._children = [self]
         out._op = "tanh"
         var a = self
@@ -601,3 +773,78 @@ class AdamVar:
                 var update = _div_raw(_scale_raw(mhat, self.lr), denom)
                 p.data = _sub_raw(p.data, update)
             i = i + 1
+
+
+# ── real matrix-backed Linear layer ──────────────────────────────────────────
+# LinearLayerVar (above) is n_out independent scalar units combined with
+# stack_vars — correct, but one Variable graph per output unit per sample.
+# This is a real nn.Linear: one weight MATRIX, one matmul call handles an
+# entire batch of samples at once. weight is (n_in x n_out); forward
+# expects x shaped (batch x n_in) and returns (batch x n_out).
+class LinearMatVar:
+    def __init__(self, n_in, n_out, seed):
+        var w_data = []
+        var i = 0
+        var s = seed
+        var scale = 1.0 / sqrt(1.0 * n_in)
+        while i < n_in * n_out:
+            s = (s * 1103515245 + 12345) % 2147483648
+            w_data.append((s / 2147483648.0 - 0.5) * 2.0 * scale)
+            i = i + 1
+        self.weight = Variable(tensor(w_data), true)
+        self.weight.rows = n_in
+        self.weight.cols = n_out
+        self.bias = Variable(zeros(n_out), true)
+
+    def forward(self, x):
+        return x.matmul(self.weight).add_bias_row(self.bias)
+
+    def parameters(self):
+        return [self.weight, self.bias]
+
+
+# Wraps a flat list of samples (each length n_in) into one 2D Variable
+# (batch x n_in), the shape matmul-based layers expect.
+def batch_var(samples, requires_grad):
+    var rows = len(samples)
+    var cols = len(samples[0])
+    var flat = []
+    var i = 0
+    while i < rows:
+        var j = 0
+        while j < cols:
+            flat.append(samples[i][j])
+            j = j + 1
+        i = i + 1
+    var v = Variable(tensor(flat), requires_grad)
+    v.rows = rows
+    v.cols = cols
+    return v
+
+
+# A real multi-layer perceptron over LinearMatVar — the matmul-based
+# counterpart to MLPVar, processing a whole batch through each layer in one
+# matmul rather than one forward pass per sample.
+class MLPMatVar:
+    def __init__(self, sizes, seed):
+        self.layers = []
+        var i = 0
+        while i < len(sizes) - 1:
+            self.layers.append(LinearMatVar(sizes[i], sizes[i + 1], seed + i * 733))
+            i = i + 1
+
+    def forward(self, x):
+        var h = x
+        var i = 0
+        while i < len(self.layers) - 1:
+            h = self.layers[i].forward(h).relu()
+            i = i + 1
+        return self.layers[len(self.layers) - 1].forward(h)
+
+    def parameters(self):
+        var out = []
+        var i = 0
+        while i < len(self.layers):
+            out = out + self.layers[i].parameters()
+            i = i + 1
+        return out
