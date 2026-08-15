@@ -480,6 +480,22 @@ layer) to loss 0.00046, byte-identical on both engines. See `HANDOFF.md`
 §0c for full detail, including the init fix this needed and how it was
 confirmed not to be a gradient bug first.
 
+Also new: `lib/nytorch/agent_learn.ny`'s `CodingAgent` — an online-learning
+agent built on the same autograd engine. Tokenises real Nython source with
+the real keyword vocabulary, trains a small next-token-category model one
+gradient step per adjacent pair (genuine online learning, not a deferred
+batch retrain), and its perplexity on code it was never trained on
+measurably improves after training on *different* code — real structural
+generalisation, verified in `examples/vm_audit40.ny`. Building it surfaced
+a real, quantified finding: `KnowledgeBase` is independently and
+incompatibly defined **three times** inside `nytorch/` alone (plus a
+fourth in `lib/aiagent.ny`) — import order silently picks whichever was
+defined last, and a caller written against a different one gets `none`
+back from every call instead of an error. Ten class names collide this way
+across `nytorch/`. See `HANDOFF.md` §5.10 for the full list — not fixed
+here, `agent_learn.ny` just doesn't add to it (`AgentKnowledge`, not
+`KnowledgeBase`).
+
 ## Transcripts
 
 - `/mnt/transcripts/journal.txt` — catalog of all session transcripts

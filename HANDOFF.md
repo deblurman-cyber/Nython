@@ -6,7 +6,9 @@ this file describes it **as it actually is**, including the traps.
 Last updated: end of round 72 (see §0/§0b for the language-level work,
 §5.3 for the IDE terminal command line, operation-based undo, and
 multi-cursor editing wired in across rounds 71b/71c, §0c for nytorch's new
-autograd engine and the VM closure bug it surfaced).
+autograd engine, the multi-layer/Adam extension, the online-learning
+coding agent, and the VM closure bug it surfaced, §5.10 for a real
+class-name-collision finding found along the way).
 
 ---
 
@@ -736,6 +738,47 @@ pattern immediately after a same-named method definition, at class-compile
 time, and tag that `sub_codes` entry — touching class compilation and every
 method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 
+### 5.10 nytorch class-name collisions across submodules (found, not fixed — round 72)
+
+Nython has no per-module namespacing for `import "path"` — every class a
+submodule defines lands in one shared global namespace, and a later import
+simply overwrites an earlier same-named class binding, silently. Building
+`lib/nytorch/agent_learn.ny` needed a persistent key/value store and reached
+for the obvious name, `KnowledgeBase` — already used elsewhere in nytorch —
+and it silently failed: `remember()`/`recall()` both returned `none`
+unconditionally. Traced to three **independently written, incompatible**
+`class KnowledgeBase` definitions inside `nytorch/` itself (`compute.ny`,
+`memory.ny`, `storage.ny` — a fourth, also incompatible, lives outside
+nytorch in `lib/aiagent.ny`). `lib/nytorch.ny`'s aggregator imports
+`memory.ny` after `storage.ny`, so `memory.ny`'s version — a completely
+different shape (`store`/`retrieve`/`keys()`, no `remember`/`recall` at
+all) — is the one actually bound by the time any caller uses the name.
+Calling a method the active definition doesn't have returns `none` instead
+of raising, which is what made this silent rather than an immediate crash.
+Confirmed with a minimal reproduction (a class matching `storage.ny`'s
+exact shape, defined in isolation, worked correctly) before writing
+`agent_learn.ny`'s own store under a different name (`AgentKnowledge`)
+rather than adding a fifth colliding definition.
+
+A repo-wide scan for the same pattern (`grep -h "^class " lib/nytorch/*.ny`,
+grouped by name) found **ten** colliding class names across `nytorch/`
+alone:
+
+```
+KnowledgeBase (×3), ReplayBuffer, MambaBlock, GraphSAGE, GATLayer,
+FederatedLearner, ExperimentTracker, DataAugmentor, DQNAgent, DDPMScheduler
+(×2 each)
+```
+
+Not fixed here — resolving it properly means renaming to disambiguate (or
+adopting `import X as Y` namespacing throughout, which the language
+already supports per CLAUDE.md's "Added" table) and auditing every internal
+caller of each colliding name across 17 files to make sure the *intended*
+definition is the one still reachable after the rename, which is real work
+deserving its own dedicated, carefully-verified change — not something to
+do incidentally while building something else. Left as a quantified,
+reproducible finding rather than a guess.
+
 ---
 
 ## 6. Test files and what they pin
@@ -748,6 +791,7 @@ method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 | `examples/vm_audit37.ny` | multi-cursor typing algorithm, `EditorBuffer` + `SelectionModel` (round 71c) |
 | `examples/vm_audit38.ny` | `lib/nytorch/autograd.ny` reverse-mode autodiff, hand-derived + numerical gradient checks, end-to-end SGD convergence (round 72) |
 | `examples/vm_audit39.ny` | `autograd.ny` multi-output layers (`select`/`stack_vars`/`LinearLayerVar`/`MLPVar`), `softmax_cross_entropy`, `AdamVar`; MLP solves XOR (round 72) |
+| `examples/vm_audit40.ny` | `lib/nytorch/agent_learn.ny`'s online-learning `CodingAgent` — real tokeniser, `AgentKnowledge` persistence, held-out perplexity improves after training on different code (round 72) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
 | `gui_tests/test_15` | cursor manager, value inspector, Unicode |
