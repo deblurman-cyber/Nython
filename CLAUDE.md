@@ -496,6 +496,23 @@ across `nytorch/`. See `HANDOFF.md` §5.10 for the full list — not fixed
 here, `agent_learn.ny` just doesn't add to it (`AgentKnowledge`, not
 `KnowledgeBase`).
 
+Final follow-up: real 2D matrix support. `Variable` gained optional
+`rows`/`cols` shape metadata over its existing flat `.data`, and
+`matmul`/`add_bias_row`/`select_row` are real batched matrix ops with
+hand-verified backward rules — `LinearMatVar`/`MLPMatVar` are the
+real-weight-matrix counterparts to `LinearLayerVar`/`MLPVar`, closing the
+"real ND tensors... absent" gap as a pure Nython addition rather than a
+native `tensor.cpp` change (too risky given ~15,000 existing lines depend
+on the current representation). `examples/vm_audit41.ny` trains
+`MLPMatVar([2,6,2])` on XOR with the whole batch going through each layer
+as one matmul call, not four separate forward passes. Along the way, a
+numerical-gradient-check false alarm (0.16 diff, traced to XOR's `(0,0)`
+point landing exactly on relu's non-differentiable point at zero, given
+zero-initialized bias) turned out not to be a bug — confirmed by printing
+the pre-activations and by re-checking with inputs that avoid that one
+coincidental point, which alone resolved it. See `HANDOFF.md` §0c for
+the full trace.
+
 ## Transcripts
 
 - `/mnt/transcripts/journal.txt` — catalog of all session transcripts

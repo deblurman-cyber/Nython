@@ -7,8 +7,8 @@ Last updated: end of round 72 (see §0/§0b for the language-level work,
 §5.3 for the IDE terminal command line, operation-based undo, and
 multi-cursor editing wired in across rounds 71b/71c, §0c for nytorch's new
 autograd engine, the multi-layer/Adam extension, the online-learning
-coding agent, and the VM closure bug it surfaced, §5.10 for a real
-class-name-collision finding found along the way).
+coding agent, real 2D matrix support, and the VM closure bug it surfaced,
+§5.10 for a real class-name-collision finding found along the way).
 
 ---
 
@@ -330,6 +330,56 @@ XOR truth table — unsolvable by any single linear layer — collapsing loss
 from 2.88 to 0.00046 and classifying all four rows correctly, byte-identical
 on both engines (interpreter ~15s, VM ~28ms for the same 400 steps).
 
+Also new: `lib/nytorch/agent_learn.ny`'s `CodingAgent` — an online-learning
+agent built on the same autograd engine. Tokenises real Nython source with
+the real keyword vocabulary, trains a small next-token-category model one
+gradient step per adjacent pair (genuine online learning, not a deferred
+batch retrain), and its perplexity on code it was never trained on
+measurably improves after training on *different* code — real structural
+generalisation, verified in `examples/vm_audit40.ny`. Building it surfaced
+a real, quantified finding: `KnowledgeBase` is independently and
+incompatibly defined **three times** inside `nytorch/` alone (plus a
+fourth in `lib/aiagent.ny`) — import order silently picks whichever was
+defined last, and a caller written against a different one gets `none`
+back from every call instead of an error. Ten class names collide this way
+across `nytorch/` alone — see §5.10 for the full list and why it wasn't
+fixed inline (`agent_learn.ny` just doesn't add to it: `AgentKnowledge`,
+not `KnowledgeBase`).
+
+**Round 72, final follow-up — real 2D matrix support.** `LinearLayerVar`/
+`MLPVar` above proved multi-layer autograd works, but as `n_out`
+independent scalar `LinearVar` units combined with `stack_vars` — a
+workaround, not a real weight matrix, because nytorch has no native ND
+tensor type. `Variable` gained optional `rows`/`cols` shape metadata over
+the same flat `.data` list (0 means "not a matrix" — every existing
+scalar/1D use is unaffected), and `matmul`/`add_bias_row`/`select_row` are
+real batched matrix operations with hand-verified backward rules (`dA = dC
+@ B^T`, `dB = A^T @ dC` for matmul; column-sum for the broadcast bias
+gradient). `LinearMatVar`/`MLPMatVar`/`batch_var` are the real-matrix
+counterparts to `LinearLayerVar`/`MLPVar`. This is a **pure Nython,
+script-level** extension, deliberately not a native `src/builtins/
+tensor.cpp` change — that native representation is depended on by ~15,000
+existing nytorch lines, so the script-level route gets real batched-matmul
+layers without that risk (at the cost of native-loop speed: matmul here is
+three nested Nython loops, fine for the small demos in this file, not
+production-scale). Verified with `examples/vm_audit41.ny`: matmul/
+add_bias_row/select_row individually numerical-gradient-checked, then a
+full `LinearMatVar`+`MLPMatVar` batched forward pass checked the same way
+(max diff ~1e-13). Along the way, the first version of that check used
+XOR's literal `(0,0)` point and found a real 0.16 discrepancy — traced
+(not a gradient bug) to `LinearMatVar`'s zero-initialized bias making
+every hidden unit's pre-activation for that one input row land **exactly**
+on relu's non-differentiable point at `x=0`; confirmed by printing the
+pre-activations (`[0,0,0,0,0,0]` for that row) and by re-running the check
+with inputs that avoid the exact zero vector, which alone brought the diff
+to 1e-13 with no code change — the well-known "relu at exactly zero"
+subgradient ambiguity, not a bug, and immaterial to training itself (one
+measure-zero kink among 400 SGD steps). Finally, `MLPMatVar([2,6,2])` +
+`AdamVar` trains on the real XOR table with the whole 4-sample batch going
+through each layer as **one** matmul call per step (not four separate
+forward passes, unlike the `MLPVar` version above) — loss 2.94 → 0.00127,
+all four rows correct, byte-identical on both engines.
+
 ---
 
 ## 1. Current state
@@ -628,14 +678,25 @@ left alone this round rather than swapped in speculatively.
 - `1.+(2, 3)` parses (operators are legal member names) but evaluates to `none` —
   integers have no `+` member. Needs primitives boxed or dispatched to a root
   type.
-- PyTorch breadth: real ND tensors and GPU dispatch are absent, and most of
-  `torch.nn` beyond activations/losses/a handful of layers is thin. Names
-  match PyTorch where the capability exists (`L1Loss`, `SmoothL1Loss`,
-  `LRScheduler`, `ExponentialLR`, …). ~~autograd absent~~ — **partially
-  closed, round 72**: `lib/nytorch/autograd.ny`'s `Variable`/`.backward()` is
-  a real reverse-mode automatic differentiation engine (dynamic graph +
-  topological sort), scoped to scalars and 1D tensors — see §0c. Extending
-  it to real ND tensors needs the ND tensor gap above closed first.
+- PyTorch breadth: GPU dispatch is absent (not attempted — no GPU hardware
+  in any environment this has been developed in, so there is nothing to
+  verify against), and most of `torch.nn` beyond activations/losses/a
+  handful of layers is thin. Names match PyTorch where the capability
+  exists (`L1Loss`, `SmoothL1Loss`, `LRScheduler`, `ExponentialLR`, …).
+  ~~autograd absent~~ — **closed, round 72**: `lib/nytorch/autograd.ny`'s
+  `Variable`/`.backward()` is a real reverse-mode automatic differentiation
+  engine (dynamic graph + topological sort) — see §0c. ~~real ND tensors
+  absent~~ — **closed differently than a native fix would, round 72**: real
+  2D matrix support (`matmul`/`add_bias_row`/`select_row`, shape metadata
+  on `Variable` over the same flat `.data`) was added as a pure Nython,
+  script-level extension rather than a native `src/builtins/tensor.cpp`
+  change — see §0c for why (the native representation is depended on by
+  ~15,000 existing nytorch lines; the script-level route gets the same
+  capability — real batched matmul-based layers — without that risk).
+  Still genuinely thinner than PyTorch: no rank >2, no broadcasting beyond
+  the one bias-row case, no native-speed matmul (it's three nested Nython
+  loops, fine for the small demos here, not for anything performance-
+  sensitive).
 
 ### 5.6 End-of-input errors lose their location — CLOSED (round 70)
 
@@ -792,6 +853,7 @@ reproducible finding rather than a guess.
 | `examples/vm_audit38.ny` | `lib/nytorch/autograd.ny` reverse-mode autodiff, hand-derived + numerical gradient checks, end-to-end SGD convergence (round 72) |
 | `examples/vm_audit39.ny` | `autograd.ny` multi-output layers (`select`/`stack_vars`/`LinearLayerVar`/`MLPVar`), `softmax_cross_entropy`, `AdamVar`; MLP solves XOR (round 72) |
 | `examples/vm_audit40.ny` | `lib/nytorch/agent_learn.ny`'s online-learning `CodingAgent` — real tokeniser, `AgentKnowledge` persistence, held-out perplexity improves after training on different code (round 72) |
+| `examples/vm_audit41.ny` | `autograd.ny` real 2D matrix support — `matmul`/`add_bias_row`/`select_row`, `LinearMatVar`/`MLPMatVar` batched training solves XOR in one matmul per layer per step (round 72) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
 | `gui_tests/test_15` | cursor manager, value inspector, Unicode |
