@@ -424,6 +424,26 @@ into `NythonIDE.__init__`/`_term_run`. See `HANDOFF.md` §5.3 for the full
 command list and what is still unverified (no headless keyboard injection
 to exercise it end-to-end).
 
+## Round 71c: operation-based undo and multi-cursor editing
+
+Two more `HANDOFF.md` §5.3 modules wired into the shipped IDE:
+
+- **`EditorBuffer` (`ide_editor.ny`) undo is now operation-based**, not a
+  whole-document snapshot per keystroke. `insert_char`/`delete_char_back`/
+  `insert_newline` record a handful of scalars and replay them through
+  `_apply_inverse` (the same pop-apply-push technique `lib/gui_piecetable.
+  ny`'s `PieceTable` demonstrates), instead of `nython_ide.ny` copying
+  `buf.get_all_text()` before every character. Undo is now per-tab; `_redo()`
+  (previously a hardcoded stub) actually works, bound to Ctrl+Y / Ctrl+Shift+Z.
+- **Real multi-cursor editing** via `lib/ide_selection.ny`'s `SelectionModel`:
+  Alt+Click / Ctrl+Alt+Down / Ctrl+Alt+Up add extra carets; typing/backspace/
+  enter apply to all of them. The existing single-selection code is untouched.
+
+See `HANDOFF.md` §5.3 for the full design rationale (why a full `PieceTable`
+storage swap was rejected in favor of adopting its technique instead) and
+documented limitations (multi-caret edits aren't one undo step; arrow keys
+move only the primary caret).
+
 ## Transcripts
 
 - `/mnt/transcripts/journal.txt` — catalog of all session transcripts

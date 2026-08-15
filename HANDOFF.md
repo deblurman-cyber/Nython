@@ -3,8 +3,9 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: end of round 71b (see §0/§0b for the language-level work,
-§5.3 for the IDE terminal command line just wired in).
+Last updated: end of round 71c (see §0/§0b for the language-level work,
+§5.3 for the IDE terminal command line, operation-based undo, and
+multi-cursor editing wired in across rounds 71b/71c).
 
 ---
 
@@ -460,12 +461,58 @@ keyboard/text-input injection, so the new terminal code paths could not be
 exercised through a real keydown/textinput sequence in this environment —
 only through static review and the construction smoke test above.
 
+**`lib/gui_piecetable.ny` — CLOSED differently than planned (round 71c)**:
+adopting `PieceTable` itself as `EditorBuffer`'s storage was assessed and
+rejected — it is offset-addressed, `EditorBuffer` is a line-list read
+directly (`buf.lines[i]`) at 13+ call sites across `nython_ide.ny`, and a
+full swap would mean rewriting every one of those with no headless way to
+keyboard-test the result. Instead, `EditorBuffer` (`ide_editor.ny`) learned
+the same *technique* `PieceTable` demonstrates — record an inverse, pop-
+apply-push between an undo and a redo stack (see `PieceTable.
+_apply_inverse`) — applied to its existing line-list storage instead of a
+new offset-addressed one. `insert_char`/`delete_char_back`/`insert_newline`
+now record four scalars per edit instead of `nython_ide.ny` snapshotting
+`buf.get_all_text()) before every keystroke (`self.undo_stack`, capped at 50
+snapshots, removed); a new `push_snapshot()` covers the coarser edits that
+still reach into `buf.lines` directly (comment toggle, cut/paste, move
+line, find/replace-all — the last of these was not undoable at all before
+this). This also made undo per-tab rather than one history shared across
+every open file, fixing the old behaviour's occasional surprise of Ctrl+Z
+switching tabs, and gave `_redo()` — a hardcoded `"Nothing to redo"` stub
+before this — a real implementation (Ctrl+Y / Ctrl+Shift+Z, "Redo" menu
+item). Verified with `examples/vm_audit36.ny` (new, 53/53 both engines —
+`EditorBuffer` is a plain class and directly testable without a window).
+
+**`lib/ide_selection.ny` — CLOSED (round 71c)**: adopted for real
+multi-cursor editing, additively — the existing single-selection code
+(`sel_on`/`sel_row`/`sel_col`, `_sel_begin`/`_sel_range`/`_sel_delete`,
+`_draw_selection`) is untouched, since it already correctly handles
+shift-arrow, click-drag, word-select and cut/copy/paste over a selection,
+and `SelectionModel` has nothing better to offer there. What's new: `self.
+selmodel = SelectionModel()` holds *extra* carets beyond the primary.
+Alt+Click adds one; Ctrl+Alt+Down/Up add one below/above the last-added
+caret (plain Alt+Up/Down already means "move this line" here, hence
+requiring Ctrl too); Escape or a plain click collapses back to one caret.
+Typing/Backspace/Enter apply to the primary as before, then replay onto
+every extra caret (`_apply_to_extra_carets`, processed last-caret-to-first
+so an earlier edit never invalidates a not-yet-processed caret's saved
+position; bounds-checked against the current buffer so a caret left over
+from a shorter/closed file can't index past the end and crash the IDE).
+Verified with `examples/vm_audit37.ny` (new, 10/10 both engines) —
+replicates the exact sort-then-apply algorithm against `EditorBuffer` +
+`SelectionModel` directly, including the case where two carets share one
+line (where processing order actually matters) and a backspace-at-three-
+carets case. **Known limitations, not solved this round**: a multi-caret
+edit is not one undo step (each caret's edit records its own entry, so one
+undo only reverts the last caret processed); arrow-key navigation moves
+only the primary caret, extras stay put until the next edit or click;
+`nython_ide.ny`'s own new glue code could not be exercised through real
+mouse/keyboard events, same headless-stub limitation noted above.
+
 Still tested, working, and unused by `nython_ide.ny`:
 
 | Module | What it provides | Notes |
 |---|---|---|
-| `lib/gui_piecetable.ny` | piece-table buffer with operation-based undo | Would replace the IDE's full-text-snapshot undo stack (`self.undo_stack` in `nython_ide.ny`, capped at 50 snapshots) — same inefficiency `MEMORY_NOTES.md` documents (373 MB → 56 MB for 400 edits). Not attempted: the piece table is offset-addressed and `EditorBuffer` (`ide_editor.ny`) is a line-list, so adopting it means rewriting every edit path in `EditorBuffer`, not a drop-in swap — real risk of editing bugs against 1053 `test_gui` assertions and no headless way to keyboard-test the result (see above). Needs its own carefully-scoped change. |
-| `lib/ide_selection.ny` | multi-cursor selection model | Same caution as above — v4 already has a single-cursor selection model (`sel_on`/`sel_row`/`sel_col`, per §4's "grep for behaviour" note); upgrading to multi-cursor touches the same wide surface. |
 | `lib/nyimgui.ny` | **Partially adopted.** `chips`/`tabs` are used (mode switcher, panel tabs). `slider`/`scrollbar`/`panel`/`toolbar_sep`/`checkbox`/`button`/`tree_node`/`icon_rail` are still unused — the IDE has its own hand-rolled scrollbars/sliders already working; per the note below, swapping them is not a clear win. |
 | `lib/gui_motion.ny` | **Partially adopted.** `Fuzzy` is used (command palette ranking, `self.fuzzy.rank(...)`). The `Flex` solver and easing curves beyond pane-open/close animation are unused. |
 
@@ -608,6 +655,8 @@ method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 |---|---|
 | `examples/vm_audit28`–`34.ny` | engine parity for language fixes |
 | `examples/vm_audit35.ny` | division ruling, instanceof/===/!==/xor/>>>=/~=, postfix ++/--, enum/namespace/module/interface/struct/new, hex/oct/binary literals (round 71) |
+| `examples/vm_audit36.ny` | `EditorBuffer` operation-based undo/redo (round 71c) |
+| `examples/vm_audit37.ny` | multi-cursor typing algorithm, `EditorBuffer` + `SelectionModel` (round 71c) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
 | `gui_tests/test_15` | cursor manager, value inspector, Unicode |
