@@ -19,6 +19,8 @@ import "ide_project.ny"
 import "lib/aiagent.ny"
 import "lib/gui_motion.ny"
 import "lib/nyimgui.ny"
+import "lib/ide_toolchain.ny"
+import "lib/ide_commands.ny"
 
 
 class IDETheme:
@@ -271,9 +273,11 @@ class NythonIDE:
         self.problem_count = 3
         self.problem_rows = []
 
-        self.term_lines = ["Nython 0.2.1 interactive shell", "type 'help' for commands", ""]
+        self.toolchain = Toolchain()
+        self.term_lines = ["Nython 0.2.1 interactive shell", "type ':help' (IDE), '>expr' (language) or '@agents' (AI)", ""]
         self.term_count = 3
         self.term_input = ""
+        self.term_hist_stash = ""
 
         self.tree = [{"depth": 0, "name": "project",   "dir": true,  "open": true},
                      {"depth": 1, "name": "src",       "dir": true,  "open": true},
@@ -356,6 +360,8 @@ class NythonIDE:
         self.ai_issues = []
         self.ai_n = 0
         self.ai_file = ""
+        # Terminal command line: :cmd / >expr / @agent, see lib/ide_commands.ny.
+        self.cmdline = CommandLine(self.toolchain, self.ai)
         # Workspace search
         self.search_query = ""
         self.search_hits = []
@@ -1375,11 +1381,25 @@ class NythonIDE:
                 if e.key == "enter":
                     self.term_lines.append("$ " + self.term_input)
                     self.term_count = self.term_count + 1
-                    var out = self._term_run(self.term_input)
-                    if out != "":
-                        self.term_lines.append(out)
-                        self.term_count = self.term_count + 1
+                    self._term_run(self.term_input)
                     self.term_input = ""
+                    e.consume()
+                    return
+                if e.key == "up":
+                    self.term_input = self.cmdline.history_prev()
+                    e.consume()
+                    return
+                if e.key == "down":
+                    self.term_input = self.cmdline.history_next()
+                    e.consume()
+                    return
+                if e.key == "tab":
+                    var comp = self.cmdline.complete(self.term_input)
+                    if len(comp) == 1:
+                        self.term_input = comp[0]
+                    elif len(comp) > 1:
+                        self.term_lines.append(string_join(comp, "  "))
+                        self.term_count = self.term_count + 1
                     e.consume()
                     return
 
@@ -3597,26 +3617,150 @@ class NythonIDE:
     def _has_break(self, line):
         return self.breaks.has_key(self._break_key(line))
 
+    # Runs a line typed into the terminal through lib/ide_commands.ny's
+    # CommandLine: ":cmd" drives the IDE, ">expr"/bare input is real language
+    # evaluation via lib/ide_toolchain.ny's Toolchain, "@agent" talks to the
+    # analyser in lib/aiagent.ny. The command line only names an action
+    # (res.action); this is where the action is actually performed, since
+    # CommandLine has no window to reach into.
     def _term_run(self, cmd):
         var c = string_strip(cmd)
         if c == "":
-            return ""
-        if c == "help":
-            return "commands: help, clear, files, version"
-        if c == "clear":
-            self.term_lines = []
-            self.term_count = 0
-            return ""
+            return
+        # A couple of one-word conveniences people type without a sigil,
+        # kept for continuity with the old ad hoc terminal.
         if c == "files":
             var out = ""
             var i = 0
             while i < self.tab_count:
                 out = out + self.tabs[i].title + "  "
                 i = i + 1
-            return out
+            self.term_lines.append(out)
+            self.term_count = self.term_count + 1
+            return
         if c == "version":
-            return "Nython 0.2.1  |  NythonIDE v4"
-        return "unknown command: " + c
+            self.term_lines.append("Nython 0.2.1  |  NythonIDE v4")
+            self.term_count = self.term_count + 1
+            return
+
+        var res = self.cmdline.execute(cmd, self)
+        var i = 0
+        while i < len(res.lines):
+            self.term_lines.append(res.lines[i])
+            self.term_count = self.term_count + 1
+            i = i + 1
+        self._term_dispatch(res.action, res.arg)
+
+    # Performs the IDE-side effect of a ":cmd" or "@agent" command. Named
+    # actions keep CommandLine itself free of any window/editor dependency.
+    def _term_dispatch(self, action, arg):
+        if action == "":
+            return
+        if action == "clear":
+            self.term_lines = []
+            self.term_count = 0
+        elif action == "run" or action == "build":
+            self._build_run("Run")
+        elif action == "vm":
+            self._build_run("VM")
+        elif action == "tokens":
+            self._build_run("Tokenize")
+        elif action == "ast":
+            self._build_run("AST")
+        elif action == "disasm":
+            self._build_run("Disasm")
+        elif action == "profile":
+            self._term_profile()
+        elif action == "save":
+            self._save_active()
+            self._toast("Saved", "ok")
+        elif action == "theme":
+            self._set_theme(not self.th.dark)
+        elif action == "quit":
+            self._save_settings()
+            self.win.running = false
+        elif action == "open":
+            if arg != "":
+                self._open_path(arg)
+            else:
+                self.term_lines.append("usage: :open <path>")
+                self.term_count = self.term_count + 1
+        elif action == "goto":
+            if arg != "":
+                self._goto_line(int(arg))
+            else:
+                self.term_lines.append("usage: :goto <line>")
+                self.term_count = self.term_count + 1
+        elif action == "find":
+            self.find_query = arg
+            self.find_open = true
+            self.find_replace_mode = false
+            self.find_field = 0
+            self._find_run()
+        elif action == "panel":
+            var pidx = -1
+            var pi = 0
+            while pi < len(self.panel_tabs):
+                if string_lower(self.panel_tabs[pi]) == string_lower(arg):
+                    pidx = pi
+                pi = pi + 1
+            if pidx >= 0:
+                self.panel_open = true
+                self.active_panel = pidx
+            else:
+                self.term_lines.append("unknown panel: " + arg)
+                self.term_count = self.term_count + 1
+        elif string_startswith(action, "agent:"):
+            self._term_agent(string_slice(action, 6, len(action)), arg)
+
+    # A run under `--profile`, top hot rows only — the IDE has no dedicated
+    # profiler panel yet, so this is the only place profiling is reachable.
+    def _term_profile(self):
+        var path = self._save_active()
+        var res = self.toolchain.profile(self.buffers[self.active_tab].get_all_text(), path)
+        if res.profile_count == 0:
+            self.term_lines.append("no profile data (did the program run to completion?)")
+            self.term_count = self.term_count + 1
+            return
+        self.term_lines.append("name                 calls   total ms   self ms")
+        self.term_count = self.term_count + 1
+        var i = 0
+        var shown = 0
+        while i < res.profile_count and shown < 15:
+            var row = res.profile_rows[i]
+            self.term_lines.append(str(row[0]) + "  " + str(row[1]) + "  " + str(row[2]) + "  " + str(row[3]))
+            self.term_count = self.term_count + 1
+            shown = shown + 1
+            i = i + 1
+
+    # @explain / @fix reuse the same pattern-based analyser the sidebar's
+    # "Analyse Buffer" action already runs (lib/aiagent.ny's CodeAnalyzer) —
+    # there is no separate LLM backend wired in, so this reports what the
+    # analyser actually finds rather than inventing a smarter answer.
+    def _term_agent(self, verb, arg):
+        if verb == "explain":
+            var text = self.buffers[self.active_tab].get_all_text()
+            self.term_lines.append(self.tabs[self.active_tab].title + ": "
+                + str(self.ai.count_lines(text)) + " lines, "
+                + str(self.ai.count_classes(text)) + " classes, "
+                + str(self.ai.count_functions(text)) + " functions")
+            self.term_count = self.term_count + 1
+            return
+        if verb == "fix":
+            self._ai_analyze(true)
+            if self.ai_n == 0:
+                self.term_lines.append("no issues found")
+                self.term_count = self.term_count + 1
+                return
+            var i = 0
+            while i < self.ai_n:
+                var it = self.ai_issues[i]
+                self.term_lines.append("line " + str(it["line"]) + ": " + it["message"])
+                self.term_count = self.term_count + 1
+                i = i + 1
+            return
+        self.term_lines.append("@" + verb + " is not wired to a live model yet — try @explain or @fix")
+        self.term_count = self.term_count + 1
 
     def _close_tab(self, idx):
         if self.tab_count <= 1:
