@@ -165,8 +165,18 @@ Value dispatch_data(NythonExecutor& E,
                                     size_t vs = pos; bool dot = false;
                                     while (pos<json.size()&&(std::isdigit(json[pos])||json[pos]=='.'||json[pos]=='-')) { if(json[pos]=='.') dot=true; pos++; }
                                     std::string ns = json.substr(vs, pos-vs);
-                                    if (dot) result->set(key, Value(std::stod(ns)));
-                                    else result->set(key, Value(static_cast<int>(std::stol(ns))));
+                                    // A malformed/edge-case number here (empty, a
+                                    // lone "-") previously threw an unguarded
+                                    // std::invalid_argument straight out of
+                                    // json_decode, past every Nython-level
+                                    // try/except, and crashed the whole process
+                                    // with an unhelpful "error: stol" instead of
+                                    // a catchable ValueError. Fall back to 0
+                                    // rather than take the process down over one
+                                    // bad field, matching the top-level-primitive
+                                    // parse a few lines above.
+                                    if (dot) { try { result->set(key, Value(std::stod(ns))); } catch (...) { result->set(key, Value(0.0)); } }
+                                    else { try { result->set(key, Value(static_cast<int>(std::stol(ns)))); } catch (...) { result->set(key, Value(0)); } }
                                 }
                             }
                         } else pos++;
