@@ -696,8 +696,22 @@ private:
             auto sw=std::static_pointer_cast<nython::node::SwitchNode>(nd);
             visit(sw->subject);
             std::vector<int> end_jumps;
+            bool wildcard_handled=false;
             for(auto& c:sw->cases){
                 auto cn=std::static_pointer_cast<nython::node::CaseNode>(c);
+                // Python-style `case _:` wildcard. The interpreter's
+                // evalSwitch (NythonExecutor.hpp) special-cases a case value
+                // of exactly "_" as always-match rather than a variable
+                // lookup; this compiled it as an ordinary comparison
+                // instead (subject == <value of undefined name _>, which
+                // reads none and is never equal), so `case _:` never ran
+                // on the VM.
+                if(cn->value_node && cn->value_node->value()=="_"){
+                    emit(Op::POP_TOP,0,l);
+                    if(cn->body) visit(cn->body);
+                    wildcard_handled=true;
+                    break;
+                }
                 emit(Op::DUP_TOP,0,l);
                 visit(cn->value_node);
                 emit(Op::COMPARE_EQ,0,l);
@@ -707,8 +721,10 @@ private:
                 end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
                 C().patch(jf,C().here());
             }
-            emit(Op::POP_TOP,0,l);
-            if(sw->default_case) visit(sw->default_case);
+            if(!wildcard_handled){
+                emit(Op::POP_TOP,0,l);
+                if(sw->default_case) visit(sw->default_case);
+            }
             int end=C().here();
             for(int j:end_jumps) C().patch(j,end);
             break;
@@ -3626,11 +3642,23 @@ private:
             double p=to_d(a[1]); std::vector<VMVal> r;
             for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::pow(to_d(x),p)));
             return VMVal::make_list(std::move(r));});
-        globals_["tensor_clip"]=globals_["clamp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["tensor_clip"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
             double lo=a.size()>=2?to_d(a[1]):-1e300,hi=a.size()>=3?to_d(a[2]):1e300;
             std::vector<VMVal> r; for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::max(lo,std::min(hi,to_d(x)))));
             return VMVal::make_list(std::move(r));});
+        // clamp(value, lo, hi) is the scalar builtin (see the interpreter's
+        // clamp in src/builtins/tensor.cpp) - a different function from
+        // tensor_clip, which clips every element of a LIST. These used to
+        // be aliased to the same tensor_clip native, so clamp(-5, 0, 10)
+        // hit tensor_clip's "a[0] must be a LIST" guard and returned [].
+        globals_["clamp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<3) return a.empty()?VMVal::make_none():a[0];
+            double v=to_d(a[0]),lo=to_d(a[1]),hi=to_d(a[2]);
+            if(v<lo) v=lo;
+            if(v>hi) v=hi;
+            if(a[0].type==VMType::INT) return VMVal::make_int((int64_t)v);
+            return VMVal::make_float(v);});
         globals_["tensor_where"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.size()<3)return VMVal::make_list();
             // tensor_where(cond_list, x_list, y_list)
@@ -4553,6 +4581,14 @@ private:
                 if(!a.empty())for(int64_t i=0;i<(int64_t)lst.size();i++)if(lst[i]==a[0])return VMVal::make_int(i);
                 return VMVal::make_int(-1);}
             if(m=="count"){if(a.empty())return VMVal::make_int((int64_t)lst.size());int64_t cnt=0;for(auto& v:lst)if(v==a[0])cnt++;return VMVal::make_int(cnt);}
+            // nums.min()/.max()/.sum() as method calls - only the global
+            // min(nums)/max(nums)/sum(nums) forms were implemented, so the
+            // method form fell through this whole if-chain and read none.
+            // Reuse the global natives, which already handle a list argument.
+            if(m=="min"||m=="max"||m=="sum"){
+                std::vector<VMVal> la={obj};
+                return vm->globals_[m].native(la);
+            }
             if(m=="clear"){lst.clear();return VMVal::make_none();}
             if(m=="copy"){return VMVal::make_list(std::vector<VMVal>(lst));}
             if(m=="extend"){if(!a.empty()&&a[0].list)for(auto& v:*a[0].list)lst.push_back(v);return VMVal::make_none();}
