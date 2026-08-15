@@ -1,0 +1,8 @@
+def make_adder(n):
+    def adder(x):
+        return x + n
+    return adder
+
+var add5 = make_adder(5)
+print add5(10)
+print add5(20)
