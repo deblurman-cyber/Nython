@@ -471,7 +471,14 @@ Building it found two real bugs:
   `Tensor.tanh()` had already dodged it via its builtin's other name,
   `tanh_fn`.
 
-See `HANDOFF.md` §0c for full detail.
+Same round, follow-up: `LinearLayerVar`/`MLPVar`/`softmax_cross_entropy`/
+`AdamVar` extend the engine to real multi-layer networks — `select()`/
+`stack_vars()` stand in for a weight matrix nytorch doesn't have (n
+independent `LinearVar` units combined into one vector), and
+`examples/vm_audit39.ny` trains one on XOR (unsolvable by a single linear
+layer) to loss 0.00046, byte-identical on both engines. See `HANDOFF.md`
+§0c for full detail, including the init fix this needed and how it was
+confirmed not to be a gradient bug first.
 
 ## Transcripts
 

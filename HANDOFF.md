@@ -303,6 +303,31 @@ Verified: `rm -rf build && make cli && make`, headless `--ide` launch exits
 content-level sweep (53 known pre-existing failures, all matching §5.8/
 §5.9's already-documented debt — nothing new) on both engines.
 
+**Same round, follow-up**: `LinearVar`/`mse_loss`/`SGDVar` alone only prove
+the engine is *correct*, not that it can train anything a single linear
+unit can't already fit. Added what a real hidden layer needs: `Variable.
+select(i)` (pick one element out of a vector Variable) and its exact
+inverse `stack_vars(list)` (combine independent scalar Variables into one
+vector), since nytorch has no real 2D tensor to hold a weight matrix —
+`LinearLayerVar(n_in, n_out)` is `n_out` independent `LinearVar` units
+combined via `stack_vars` instead. `MLPVar(sizes)` stacks those with `relu`
+between layers. `softmax_cross_entropy(logits, target)` is the standard
+numerically-stable log-sum-exp formula built entirely from already-verified
+ops (`sub`/`exp`/`sum`/`log`/`select`), not by differentiating through the
+native `softmax`/`cross_entropy_loss` builtins (which return raw tensors,
+no gradient at all). `AdamVar` is real bias-corrected Adam operating on
+`Variable.grad` directly. `LinearVar`'s init now scales by `1/sqrt(n_in)`
+(simplified Xavier/He) instead of a fixed range — a fixed-width init left a
+multi-layer network badly conditioned as fan-in grew between layers,
+caught when a first XOR attempt plateaued at a suspiciously round loss;
+confirmed **not** a gradient bug first (numerical check: max
+`|analytic − numeric|` ≈ 1e-12, i.e. machine precision, across all 12
+parameters of a `[2,4,2]` network) before touching the init. `examples/
+vm_audit39.ny` trains `MLPVar([2,6,2])` + `AdamVar` for 400 steps on the
+XOR truth table — unsolvable by any single linear layer — collapsing loss
+from 2.88 to 0.00046 and classifying all four rows correctly, byte-identical
+on both engines (interpreter ~15s, VM ~28ms for the same 400 steps).
+
 ---
 
 ## 1. Current state
@@ -722,6 +747,7 @@ method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 | `examples/vm_audit36.ny` | `EditorBuffer` operation-based undo/redo (round 71c) |
 | `examples/vm_audit37.ny` | multi-cursor typing algorithm, `EditorBuffer` + `SelectionModel` (round 71c) |
 | `examples/vm_audit38.ny` | `lib/nytorch/autograd.ny` reverse-mode autodiff, hand-derived + numerical gradient checks, end-to-end SGD convergence (round 72) |
+| `examples/vm_audit39.ny` | `autograd.ny` multi-output layers (`select`/`stack_vars`/`LinearLayerVar`/`MLPVar`), `softmax_cross_entropy`, `AdamVar`; MLP solves XOR (round 72) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
 | `gui_tests/test_15` | cursor manager, value inspector, Unicode |
