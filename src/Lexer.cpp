@@ -324,17 +324,23 @@ void Lexer::unexpectedChar() {
 }
 
 Token Lexer::next() {
-    if(current>=int(tokens.size())) return Token();
+    // Past the last token (the End token pushed by tokenize()): keep
+    // returning that End token rather than a default-constructed Token,
+    // whose Location{} is (1,1,"stdin"). A default-constructed token has no
+    // relation to the file being parsed, so an unterminated construct at
+    // EOF reported "stdin:1:1" instead of the real end-of-file position.
+    if(current>=int(tokens.size())) return tokens.empty() ? Token() : tokens.back();
     return tokens[current++];
 }
 
 Token Lexer::prev() {
-    if(current <= 0) return Token();
+    if(current <= 0) return tokens.empty() ? Token() : tokens.front();
     return tokens[current-1];
 }
 
 Token Lexer::curr() {
-    if(current>=int(tokens.size()) || current < 0) return Token();
+    if(current < 0) return tokens.empty() ? Token() : tokens.front();
+    if(current>=int(tokens.size())) return tokens.empty() ? Token() : tokens.back();
     return tokens[current];
 }
 

@@ -1,0 +1,3 @@
+build/
+*.o
+ny_test

@@ -718,6 +718,37 @@ Value dispatch_core(NythonExecutor& E,
         if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "dir" || name == "vars" || name == "globals" || name == "locals" || name == "iter" || name == "help" || name == "format" || name == "slice" || name == "divmod" || name == "complex") {
             return NONE_VALUE; // placeholder
         }
+        // id(x) / hash(x) — registered as recognised builtin names (see
+        // NythonExecutor::registerBuiltins) but never actually dispatched
+        // here, so a bare id(x)/hash(x) call fell through every dispatch_*
+        // module and returned UNDEFINED, which reads as 0. The method form
+        // obj.id()/obj.hash() (objectProtocol) already worked; this gives
+        // the global function the same behaviour instead of nothing.
+        if (name == "id") {
+            if (args.empty()) return Value(bigint((long long)0));
+            Value& v = args[0];
+            // Heap-allocated values (class instances, containers): identity
+            // is the underlying pointer, masked to fit a signed bigint the
+            // same way objectProtocol's "id" method does.
+            if (v.type == ValueType::USERDATA && v.value.p) {
+                unsigned long long raw = (unsigned long long)(size_t)v.value.p;
+                return Value(bigint((long long)(raw & 0x7fffffffULL)));
+            }
+            if (v.isCollectable() && v.value.gc) {
+                unsigned long long raw = (unsigned long long)(size_t)v.value.gc;
+                return Value(bigint((long long)(raw & 0x7fffffffULL)));
+            }
+            // Primitives have no heap identity; derive a stable value so
+            // id(x) is non-zero, repeatable for the same x, and type-aware
+            // (id(1) != id(1.0) even though 1 == 1.0).
+            unsigned long long h = std::hash<std::string>{}(getStringValue(v) + "|" + std::to_string((int)v.type));
+            return Value(bigint((long long)(h & 0x7fffffffULL)));
+        }
+        if (name == "hash") {
+            if (args.empty()) return Value(bigint((long long)0));
+            unsigned long long h = std::hash<std::string>{}(getStringValue(args[0]));
+            return Value(bigint((long long)(h & 0x7fffffffULL)));
+        }
         if (name == "sqrt") {
             if (args.size() >= 1) {
                 double v = (args[0].type == ValueType::DOUBLE) ? static_cast<double>(args[0].value.d) : (double)bigint_to_i64(args[0].value.i);

@@ -3083,6 +3083,47 @@ private:
                     if(sub->name==method&&!sub->is_class) return exec_code(sub,args,obj);
                 cls=cit->second->parent_class;
             }
+            // Universal object protocol — mirrors NythonExecutor::objectProtocol
+            // on the interpreter (see test_25_object_protocol.ny, which probes
+            // for support and skipped here because the VM had none of this).
+            // Only reached once no user-defined method/attribute of this name
+            // was found above, so a class's own to_string/class_name etc, if
+            // it defines one, still wins.
+            if(method=="class_name"||method=="type_name")
+                return VMVal::make_str(obj.class_name);
+            if(method=="to_string"||method=="str")
+                return VMVal::make_str("<"+obj.class_name+" instance>");
+            if(method=="id"){
+                uintptr_t raw=obj.map?(uintptr_t)obj.map.get():0;
+                return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
+            }
+            if(method=="hash"){
+                uintptr_t raw=obj.map?(uintptr_t)obj.map.get():0;
+                uint64_t h=std::hash<std::string>{}(obj.class_name+"|"+std::to_string(raw));
+                return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));
+            }
+            if(method=="is_a"||method=="instance_of"){
+                if(args.empty()) return VMVal::make_bool(false);
+                std::string want=args[0].to_string();
+                std::string cur=obj.class_name;
+                int guard=0;
+                while(!cur.empty()&&guard++<64){
+                    if(cur==want) return VMVal::make_bool(true);
+                    auto cit=class_reg_.find(cur);
+                    if(cit==class_reg_.end()) break;
+                    cur=cit->second->parent_class;
+                }
+                return VMVal::make_bool(false);
+            }
+            if(method=="equals_to"||method=="same_as"){
+                if(args.empty()||args[0].type!=VMType::INSTANCE) return VMVal::make_bool(false);
+                return VMVal::make_bool(obj.map.get()==args[0].map.get());
+            }
+            if(method=="fields"||method=="attributes"){
+                std::vector<VMVal> r;
+                if(obj.map) for(auto& kv:*obj.map) r.push_back(VMVal::make_str(kv.first));
+                return VMVal::make_list(std::move(r));
+            }
         }
         // CLASS.method(self, args...) — parent class method call pattern
         // e.g. Animal.__init__(self, name) → args[0] is the instance, args[1:] are method args
@@ -5002,10 +5043,31 @@ private:
         globals_["copy"]=globals_["deepcopy"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_none():a[0];});
         globals_["id"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return VMVal::make_int(a.empty()?0:(int64_t)(uintptr_t)a[0].list.get());});
+            // Only checked a[0].list, so id() on anything but a LIST (a map,
+            // instance, function, string, int...) fell through to a null
+            // shared_ptr and always returned 0. Use whichever backing
+            // pointer the value actually has; primitives fall back to a
+            // stable hash so id(x) is at least non-zero and repeatable.
+            if(a.empty()) return VMVal::make_int(0);
+            VMVal& v=a[0];
+            uintptr_t raw=0;
+            switch(v.type){
+                case VMType::LIST:      raw=(uintptr_t)v.list.get(); break;
+                case VMType::MAP:
+                case VMType::INSTANCE:  raw=(uintptr_t)v.map.get();  break;
+                case VMType::FUNCTION:
+                case VMType::CLASS:     raw=(uintptr_t)v.code.get(); break;
+                case VMType::ITERATOR:  raw=(uintptr_t)v.iter.get(); break;
+                case VMType::GENERATOR: raw=(uintptr_t)v.gen.get();  break;
+                default: raw=0; break;
+            }
+            if(raw) return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
+            uint64_t h=std::hash<std::string>{}(v.to_string()+"|"+std::to_string((int)v.type));
+            return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
         globals_["hash"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_int(0);
-            return VMVal::make_int((int64_t)std::hash<std::string>{}(a[0].to_string()));});
+            uint64_t h=std::hash<std::string>{}(a[0].to_string());
+            return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
         globals_["random"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_float((double)rand()/(double)RAND_MAX);});
         globals_["randint"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             int64_t lo=a.size()>0?(a[0].type==VMType::INT?a[0].i:(int64_t)to_d(a[0])):0;

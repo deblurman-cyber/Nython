@@ -827,13 +827,6 @@ Value dispatch_tensor(NythonExecutor& E,
             }
             return Value(0);
         }
-        if (name == "id") {
-            if (args.size() >= 1) {
-                if (args[0].value.p) return Value((int)(uintptr_t)args[0].value.p);
-                return Value(0);
-            }
-            return Value(0);
-        }
         if (name == "isinstance") {
             if (args.size() >= 2) {
                 // Extract type name: handle builtin funcs (int, str, float...) and class objects
