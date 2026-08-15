@@ -16,7 +16,7 @@ def check(name, got, expected):
 check("int division", 7 // 2, 3)
 check("neg int div", -7 // 2, -4)
 check("modulo", 17 % 5, 2)
-check("neg modulo", -7 % 3, -1)  # C-style modulo (not Python-style)
+check("neg modulo", -7 % 3, 2)  # floor modulo, matching floor // (see CLAUDE.md)
 check("power", 2 ** 10, 1024)
 check("float arith", round(0.1 + 0.2, 10), round(0.3, 10))
 # Note: large int overflow is a known limitation (32-bit int paths)

@@ -1300,6 +1300,17 @@ private:
         if(op=="*=") return Op::IMUL;
         if(op=="/=") return Op::BINARY_DIV;
         if(op=="%=") return Op::BINARY_MOD;
+        // These fell through to NOP, which the ASSIGNMENT_AUG case treats as
+        // "combine target and new value" - with no combining opcode emitted,
+        // the target was just silently replaced by the right-hand operand
+        // (x=24; x//=5 left x==5, the unmodified operand, instead of 4).
+        if(op=="//=") return Op::BINARY_FLOOR_DIV;
+        if(op=="**=") return Op::BINARY_POW;
+        if(op=="&=") return Op::BINARY_AND;
+        if(op=="|=") return Op::BINARY_OR;
+        if(op=="^=") return Op::BINARY_XOR;
+        if(op=="<<=") return Op::BINARY_LSHIFT;
+        if(op==">>=") return Op::BINARY_RSHIFT;
         return Op::NOP;
     }
 };
@@ -4856,12 +4867,29 @@ private:
                 return VMVal::make_list(std::move(r));}
             return VMVal::make_list();});
         globals_["dict"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_map();});
+        // Tag the type-constructor builtins with the type name they build, so
+        // isinstance(x, list) — passing the bare builtin, not a string — has
+        // something to compare against. Done once, after every builtin above
+        // has taken its final binding (list/dict are each registered twice;
+        // this reads whichever registration actually won), rather than at
+        // each individual registration site.
+        for(auto& nm_canon : std::vector<std::pair<std::string,std::string>>{
+                {"int","int"},{"float","float"},{"bool","bool"},{"str","str"},
+                {"string","str"},{"list","list"},{"tuple","list"},
+                {"dict","map"},{"set","list"}}){
+            auto git=globals_.find(nm_canon.first);
+            if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
+                git->second.class_name=nm_canon.second;
+        }
         globals_["isinstance"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
             VMVal& obj=a[0]; VMVal& cls=a[1];
             std::string cls_name;
             if(cls.type==VMType::CLASS) cls_name=cls.class_name;
             else if(cls.type==VMType::STRING) cls_name=cls.s;
+            // isinstance(x, list) / isinstance(x, int): the bare builtin, not
+            // a string. These are tagged with the type they build above.
+            else if(cls.type==VMType::NATIVE&&!cls.class_name.empty()) cls_name=cls.class_name;
             else return VMVal::make_bool(false);
             if(obj.type!=VMType::INSTANCE){
                 // Builtin/primitive types by name, e.g. isinstance(42, "int").
