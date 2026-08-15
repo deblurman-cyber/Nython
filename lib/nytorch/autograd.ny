@@ -84,6 +84,14 @@ def _sum_raw(a):
         return tensor_sum(a)
     return a
 
+# Elementwise/scalar divide via reciprocal-then-multiply — the same trick
+# log()'s backward rule already uses (tensor_pow(x, -1.0)) — since there is
+# no tensor_div native to call directly.
+def _div_raw(a, b):
+    if _is_vec(a):
+        return tensor_mul(a, tensor_pow(b, 0.0 - 1.0))
+    return a / b
+
 
 class Variable:
     def __init__(self, data, requires_grad):
@@ -197,6 +205,23 @@ class Variable:
         def _bw():
             a._accum(_scale_raw(b.data, out.grad))
             b._accum(_scale_raw(a.data, out.grad))
+        out._backward_fn = _bw
+        return out
+
+    # Pick out one element of a vector Variable as its own scalar Variable.
+    # The inverse of stack_vars() below — gradient flows back to only the
+    # selected index, everywhere else in self.grad gets 0 from this op.
+    def select(self, i):
+        var out = Variable(self.data[i], self.requires_grad)
+        out._children = [self]
+        out._op = "select"
+        var a = self
+        var idx = i
+        var n = len(self.data)
+        def _bw():
+            var g = zeros(n)
+            g[idx] = out.grad
+            a._accum(g)
         out._backward_fn = _bw
         return out
 
@@ -359,12 +384,18 @@ class Variable:
 
 class LinearVar:
     def __init__(self, n_in, seed):
+        # Scaled by 1/sqrt(n_in) (a simplified Xavier/He-style init) rather
+        # than a fixed range — a fixed-width init that is fine for one layer
+        # leaves a multi-layer MLP (see MLPVar) badly conditioned as the
+        # fan-in of later layers grows, which is most of why the first
+        # version of the XOR test below got stuck rather than converging.
         var w = []
         var i = 0
         var s = seed
+        var scale = 1.0 / sqrt(1.0 * n_in)
         while i < n_in:
             s = (s * 1103515245 + 12345) % 2147483648
-            w.append((s / 2147483648.0 - 0.5) * 0.2)
+            w.append((s / 2147483648.0 - 0.5) * 2.0 * scale)
             i = i + 1
         self.weight = Variable(tensor(w), true)
         self.bias = Variable(0.0, true)
@@ -400,4 +431,173 @@ class SGDVar:
         var i = 0
         while i < len(self.params):
             self.params[i].zero_grad()
+            i = i + 1
+
+
+# ── multi-output layers, classification loss, and a proper optimizer ────────
+# LinearVar above is single-output (a weight VECTOR, one dot product). A real
+# layer needs multiple output units — normally a weight MATRIX, but nytorch
+# has no real 2D tensor support (CLAUDE.md's "real ND tensors... absent" gap
+# again) to hold one. stack_vars/select are the workaround: a multi-output
+# layer is just N independent LinearVar units whose scalar outputs get
+# combined into one vector Variable, and indexing back out of a vector
+# Variable is select(). Composing scalar autograd nodes this way is slower
+# than a real batched matmul would be, but every gradient through it is
+# exactly as correct, since it is built entirely from ops already verified
+# above rather than a new differentiation rule of its own.
+
+# Combines several independent SCALAR Variables into one vector Variable.
+# The inverse of Variable.select(): out[i]'s gradient flows back to only
+# vars_list[i], not the others.
+def stack_vars(vars_list):
+    var n = len(vars_list)
+    var data = []
+    var i = 0
+    while i < n:
+        data.append(vars_list[i].data)
+        i = i + 1
+    var out = Variable(tensor(data), true)
+    out._children = vars_list
+    out._op = "stack"
+    var srcs = vars_list
+    def _bw():
+        var k = 0
+        while k < len(srcs):
+            srcs[k]._accum(out.grad[k])
+            k = k + 1
+    out._backward_fn = _bw
+    return out
+
+
+# Numerically-stable softmax + negative-log-likelihood in one differentiable
+# step, built entirely from ops that already have a backward rule (sub, exp,
+# sum, log, select) rather than differentiating through the native softmax/
+# cross_entropy_loss builtins, which return raw tensors with no gradient at
+# all. loss = -log(softmax(logits)[target]) = log_sum_exp(logits) -
+# logits[target], shifting by the (constant, non-differentiated) max first
+# for numerical stability — exactly PyTorch's own log-sum-exp trick.
+def softmax_cross_entropy(logits, target_idx):
+    var n = len(logits.data)
+    var mx = logits.data[0]
+    var i = 1
+    while i < n:
+        if logits.data[i] > mx:
+            mx = logits.data[i]
+        i = i + 1
+    var shift = Variable(_scale_raw(ones(n), mx), false)
+    var shifted = logits.sub(shift)
+    var exps = shifted.exp()
+    var sum_exp = exps.sum()
+    var log_sum_exp = sum_exp.log()
+    var target_val = shifted.select(target_idx)
+    return log_sum_exp.sub(target_val)
+
+
+# A real multi-output linear layer: n_out independent LinearVar units,
+# stacked into one vector output. Matches nn.Linear(n_in, n_out)'s shape
+# contract even without a weight matrix behind it.
+class LinearLayerVar:
+    def __init__(self, n_in, n_out, seed):
+        self.units = []
+        var i = 0
+        while i < n_out:
+            self.units.append(LinearVar(n_in, seed + i * 97 + 13))
+            i = i + 1
+
+    def forward(self, x):
+        var outs = []
+        var i = 0
+        while i < len(self.units):
+            outs.append(self.units[i].forward(x))
+            i = i + 1
+        return stack_vars(outs)
+
+    def parameters(self):
+        var out = []
+        var i = 0
+        while i < len(self.units):
+            out = out + self.units[i].parameters()
+            i = i + 1
+        return out
+
+
+# A real multi-layer perceptron: LinearLayerVar + relu between every pair of
+# layers, raw (unactivated) output from the last one — the shape every
+# other framework's MLP has, and (unlike LinearVar alone) can solve problems
+# a single linear layer provably cannot, like XOR (see vm_audit39.ny).
+class MLPVar:
+    def __init__(self, sizes, seed):
+        self.layers = []
+        var i = 0
+        while i < len(sizes) - 1:
+            self.layers.append(LinearLayerVar(sizes[i], sizes[i + 1], seed + i * 733))
+            i = i + 1
+
+    def forward(self, x):
+        var h = x
+        var i = 0
+        while i < len(self.layers) - 1:
+            h = self.layers[i].forward(h).relu()
+            i = i + 1
+        return self.layers[len(self.layers) - 1].forward(h)
+
+    def parameters(self):
+        var out = []
+        var i = 0
+        while i < len(self.layers):
+            out = out + self.layers[i].parameters()
+            i = i + 1
+        return out
+
+
+# Adam, the optimizer actually used to train most real models — SGDVar alone
+# only proves the gradients are correct, not that this library can train
+# anything harder than a straight line. Standard bias-corrected first/second
+# moment estimates; operates directly on Variable.grad rather than taking a
+# separately-computed `grads` list like optimizers.ny's gradient-free Adam.
+class AdamVar:
+    def __init__(self, params, lr, beta1, beta2, eps):
+        self.params = params
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.t = 0
+        self.m = []
+        self.v = []
+        var i = 0
+        while i < len(params):
+            self.m.append(_zeros_like(params[i].data))
+            self.v.append(_zeros_like(params[i].data))
+            i = i + 1
+
+    def zero_grad(self):
+        var i = 0
+        while i < len(self.params):
+            self.params[i].zero_grad()
+            i = i + 1
+
+    def step(self):
+        self.t = self.t + 1
+        var b1 = self.beta1
+        var b2 = self.beta2
+        var eps_c = self.eps
+        var bias1 = 1.0 - b1 ** self.t
+        var bias2 = 1.0 - b2 ** self.t
+        var i = 0
+        while i < len(self.params):
+            var p = self.params[i]
+            if p.grad != none:
+                self.m[i] = _add_raw(_scale_raw(self.m[i], b1), _scale_raw(p.grad, 1.0 - b1))
+                var gsq = _mul_raw(p.grad, p.grad)
+                self.v[i] = _add_raw(_scale_raw(self.v[i], b2), _scale_raw(gsq, 1.0 - b2))
+                var mhat = _scale_raw(self.m[i], 1.0 / bias1)
+                var vhat = _scale_raw(self.v[i], 1.0 / bias2)
+                var denom = 0.0
+                if _is_vec(vhat):
+                    denom = tensor_apply(vhat, lambda x: sqrt(x) + eps_c)
+                else:
+                    denom = sqrt(vhat) + eps_c
+                var update = _div_raw(_scale_raw(mhat, self.lr), denom)
+                p.data = _sub_raw(p.data, update)
             i = i + 1
