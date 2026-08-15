@@ -1,0 +1,11 @@
+var m = {"name": "Nython", "version": 3, "lang": "C++"}
+print m.keys()
+print m.values()
+print m.has_key("name")
+print m.has_key("foo")
+print m.get("name")
+print m.get("missing", "default_val")
+print m.size()
+print m.items()
+m.remove("lang")
+print m.keys()

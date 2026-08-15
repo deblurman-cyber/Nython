@@ -1,0 +1,8 @@
+print "Hello, {}!".format("World")
+print "{} + {} = {}".format("1", "2", "3")
+print "Name: {}, Age: {}".format("Alice", "30")
+print "hello world".capitalize()
+print "hello world".title()
+print "42".zfill(8)
+print "hi".center(10)
+print "hello hello hello".count("hello")
