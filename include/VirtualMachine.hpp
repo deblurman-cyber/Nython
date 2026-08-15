@@ -3257,6 +3257,19 @@ private:
         if(globals_.count(guard_key) && alias.empty()) return;
         globals_[guard_key] = VMVal::make_bool(true);
         if(name=="nytorch"){ register_nytorch_builtins(); return; }
+        // "nytorch_classes" used to sit in builtin_modules below - a no-op
+        // acknowledgement, on the theory its functions were "already
+        // registered as globals". That's true of the native tensor_* ops
+        // (register_nytorch_builtins), but the class library itself
+        // (Tensor, and everything built on it, in lib/nytorch.ny) was never
+        // actually loaded, so `Tensor(...)` read as an undefined name on
+        // this engine while the interpreter's own `nytorch_classes` handler
+        // (NythonExecutor.hpp) really does load lib/nytorch.ny. Falling
+        // through to the normal file-import path below (via filepath) does
+        // the same here; the VM's shared_ptr-backed containers don't have
+        // the interpreter's container-leak problem that made loading this
+        // 220+-class file risky there (see GC_NOTES.md).
+        if(name=="nytorch_classes"){ register_nytorch_builtins(); }
         if(name=="os"||name=="shell"||name=="sh"){ register_os_builtins(); return; }
         if(name=="math"){ register_math_builtins(); return; }
         if(name=="time"){ register_time_builtins(); return; }
@@ -3277,7 +3290,7 @@ private:
         // just an acknowledgement.
         static const std::set<std::string> builtin_modules = {
             "random","collections","crypto","datetime","hash","http","re","regex",
-            "sys","ml","ai","net","agent_net","nytorch_classes","threading",
+            "sys","ml","ai","net","agent_net","threading",
             "thread","threads","threading_lib","string","math","time","json",
             "io","fs","file","os","sh","shell","gui","stdlib","oslib","os_lib",
             "netlib","network_lib","sockets","webserver","httpserver",
@@ -3292,6 +3305,7 @@ private:
             {"threading_lib","lib/thread.ny"},{"clientserver","lib/clientserver.ny"},
             {"cs_lib","lib/clientserver.ny"},{"gui","lib/gui.ny"},
             {"aiagent","lib/aiagent.ny"},{"nyxai","lib/aiagent.ny"},{"nyx","lib/aiagent.ny"},
+            {"nytorch_classes","lib/nytorch.ny"},
         };
         std::string filepath;
         auto it=lib_map.find(name);
