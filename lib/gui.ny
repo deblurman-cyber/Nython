@@ -11312,7 +11312,7 @@ class EditorTab:
 
     def _ext_icon(self):
         if string_endswith(self.filename, ".ny"):
-            self.icon = "?"
+            self.icon = "◈"
         elif string_endswith(self.filename, ".json"):
             self.icon = "{}"
         elif string_endswith(self.filename, ".md"):
