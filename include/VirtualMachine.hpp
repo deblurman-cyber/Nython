@@ -3308,7 +3308,13 @@ private:
                 if(held.type==VMType::NATIVE)
                     return vm_call(held,args,std::nullopt);
                 if(held.type==VMType::FUNCTION)
-                    return exec_code(held.code,args,obj);
+                    // held.closure_env must come along too, or a closure
+                    // stored in an attribute and invoked as obj.attr()
+                    // silently loses every captured variable (they read
+                    // back as none) the moment it's called this way instead
+                    // of via a plain local reference (`f = obj.attr; f()`,
+                    // which already passed callee.closure_env correctly).
+                    return exec_code(held.code,args,obj,held.closure_env);
             }
         }
         if(obj.type==VMType::INSTANCE){
